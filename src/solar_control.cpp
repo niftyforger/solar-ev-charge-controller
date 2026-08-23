@@ -30,6 +30,7 @@ static float compute_next_target_amps(float currentTargetA, float gridPowerW,
 
 static void connect_wifi() {
     WiFi.mode(WIFI_STA);
+    WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 

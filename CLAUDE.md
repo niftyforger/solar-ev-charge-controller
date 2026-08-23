@@ -27,7 +27,7 @@ Divert surplus solar into EV charging by dynamically limiting the charge current
 - Useful registers (community-documented, e.g. `mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant` on GitHub):
   - `13009` — total active power at the meter (grid import/export; negative = exporting). This is the primary control input.
   - PV/DC output registers (`5016`, `13033`) if computing surplus as PV output minus house load rather than using meter export directly
-- **Implemented assumption (unverified against the real inverter):** `13009` is read as a 32-bit signed value spanning registers 13009-13010 (big-endian word order, 1W/count), via Modbus function code 4 (Read Input Registers), unit ID 1 — matching the common Sungrow SHx convention. Confirm against the real WiNet-S response during bring-up; if it turns out to be a single 16-bit register or FC3 (Read Holding Registers) instead, `REG_GRID_POWER_COUNT` and the FC in `modbus_tcp_client.cpp` need adjusting.
+- `13009` is a 32-bit signed value spanning registers 13009-13010, S32/FC4/unit ID 1 as assumed, 1W/count. **Confirmed against the real WiNet-S during bring-up (2026-08-24): the word order is low-word-first (little-endian), not big-endian as originally assumed** — the community-convention guess was wrong on this one point. `modbus_tcp_client.cpp`'s `modbus_read_grid_power_w` composes `raw` as `(regs[1] << 16) | regs[0]` to match. This was caught because it produced tens-of-millions-of-watts readings on the status LCD (the sign-extension high word landing in the high position of the combined value) — if the register mapping is ever revisited, re-verify word order the same way: log `regs[0]`/`regs[1]` raw and sanity-check against a known real export/import figure.
 - **Control loop is self-referential**: the EV's own draw is part of what `13009` measures, so raising target current will itself reduce measured export on the next poll. The control loop must account for this — bound the per-adjustment step size, and hold a settling period after each change before reacting to the next reading — rather than treating each poll as an independent, instantaneous surplus measurement. This is a stronger requirement than plain smoothing/hysteresis against cloud transients; it's closed-loop feedback with a delay, not just noisy input.
 
 ## Hardware: single ESP32-S3
@@ -112,7 +112,6 @@ Still genuinely unresolved (no amount of firmware work settles these — need th
 - Final clamp switch component selection (MOSFET vs. bidirectional analog switch) and optocoupler selection for the CP front end.
 - Exact resistor divider and comparator threshold values for state discrimination (A/B/C/D) on the sensing side — the ADC millivolt breakpoints in `config.h` are illustrative placeholders pending a scope on the real CP voltages.
 - Whether 3.3V power is sufficient LCD contrast/brightness or a level shifter for 5V is worth adding.
-- Whether register `13009` is really S32/FC4 as assumed (see "Solar data source" above) — unverified against the real WiNet-S.
 
 Have an implemented default now, but still need bench confirmation/tuning:
 

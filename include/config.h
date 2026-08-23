@@ -97,6 +97,7 @@
 #define STEP_MAX_A_PER_POLL       2.0f
 #define SETTLE_MS                 15000UL
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
+#define WIFI_HOSTNAME              "geely-charger-controller"
 
 // ---------------------------------------------------------------------------
 // Sungrow SH8.0RS Modbus TCP (via WiNet-S dongle)

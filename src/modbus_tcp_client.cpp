@@ -108,7 +108,10 @@ bool modbus_read_grid_power_w(IPAddress ip, float &outWatts) {
     if (!client.readInputRegisters(REG_GRID_POWER, REG_GRID_POWER_COUNT, regs)) {
         return false;
     }
-    int32_t raw = ((int32_t)((uint32_t)regs[0] << 16 | regs[1]));
+    // Confirmed against the real WiNet-S during bring-up: this register pair
+    // is low-word-first (little-endian word order), not big-endian as
+    // originally assumed - see CLAUDE.md.
+    int32_t raw = ((int32_t)((uint32_t)regs[1] << 16 | regs[0]));
     outWatts = (float)raw;
     return true;
 }
