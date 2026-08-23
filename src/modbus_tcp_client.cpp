@@ -112,6 +112,13 @@ bool modbus_read_grid_power_w(IPAddress ip, float &outWatts) {
     // is low-word-first (little-endian word order), not big-endian as
     // originally assumed - see CLAUDE.md.
     int32_t raw = ((int32_t)((uint32_t)regs[1] << 16 | regs[0]));
-    outWatts = (float)raw;
+    // Also confirmed during bring-up: the register's native polarity is
+    // positive = exporting / negative = importing - opposite of what was
+    // originally assumed. Negate here so the rest of the codebase's
+    // negative = exporting convention (see CLAUDE.md) holds against the
+    // real hardware.
+    outWatts = -(float)raw;
+    Serial.printf("[modbus] regs[0]=0x%04X regs[1]=0x%04X raw=%ld grid_power_w=%.0f (%s)\n",
+                  regs[0], regs[1], (long)raw, outWatts, outWatts <= 0 ? "exporting" : "importing");
     return true;
 }
