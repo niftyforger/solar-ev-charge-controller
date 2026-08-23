@@ -24,6 +24,6 @@ private:
     uint16_t _transactionId;
 };
 
-// Convenience helper: reads REG_GRID_POWER (2 registers, S32, big-endian
+// Convenience helper: reads REG_GRID_POWER (2 registers, S32, little-endian
 // word order, 1W/count) and returns it as signed watts. Negative = exporting.
 bool modbus_read_grid_power_w(IPAddress ip, float &outWatts);
