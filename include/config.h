@@ -104,7 +104,9 @@
 // ---------------------------------------------------------------------------
 #define MODBUS_TCP_PORT           502
 #define MODBUS_UNIT_ID            1
-#define REG_GRID_POWER            13009   // S32, W, negative = exporting
+#define REG_GRID_POWER            13009   // S32, W, raw register is positive = exporting;
+                                            // modbus_read_grid_power_w() negates it so
+                                            // software-facing values are negative = exporting
 #define REG_GRID_POWER_COUNT      2
 #define MODBUS_TIMEOUT_MS         2000
 
