@@ -66,9 +66,9 @@ void status_display_task(void *pvParameters) {
         lcd.print(line);
 
         lcd.setCursor(0, 3);
-        snprintf(line, sizeof(line), "WiFi:%s MB:%s Age:%lus",
+        snprintf(line, sizeof(line), "WiFi:%s %s Age:%lus",
                  solar.wifi_connected ? "OK" : "--",
-                 solar.modbus_ok ? "OK" : "--",
+                 solar.simulated ? "SIM" : (solar.modbus_ok ? "MB:OK" : "MB:--"),
                  (unsigned long)ageS);
         pad20(line);
         lcd.print(line);

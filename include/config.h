@@ -99,6 +99,12 @@
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
 #define WIFI_HOSTNAME              "geely-charger-controller"
 
+// Solar simulation mode (night-time / no-sun bench testing): a WiFi control
+// page toggles between real Modbus readings and this synthetic value. See
+// CLAUDE.md "OTA & simulation mode".
+#define SIM_DEFAULT_GRID_POWER_W  -1000.0f   // negative = exporting
+#define SIM_HTTP_PORT              80
+
 // ---------------------------------------------------------------------------
 // Sungrow SH8.0RS Modbus TCP (via WiNet-S dongle)
 // ---------------------------------------------------------------------------
