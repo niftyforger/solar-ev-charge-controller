@@ -40,7 +40,7 @@
 
 #define MIN_CURRENT_A            6.0f
 #define MAX_CURRENT_A            32.0f
-#define MAINS_VOLTAGE_V          230.0f
+#define MAINS_VOLTAGE_V          240.0f
 
 // Native PWM sanity window (~1kHz nominal, generous guard band against glitches)
 #define NATIVE_PERIOD_MIN_US     800.0
