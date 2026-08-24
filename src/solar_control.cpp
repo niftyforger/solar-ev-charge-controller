@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
+#include <math.h>
 
 // What the control law just did, kept alongside the numeric target so the
 // web UI can explain the decision in words instead of just showing a number.
@@ -160,7 +161,6 @@ static void handle_root() {
 
     snprintf(s_page_body, sizeof(s_page_body),
         "<!DOCTYPE html><html><head><title>geely-charger-controller</title>"
-        "<meta http-equiv=\"refresh\" content=\"5\">"
         "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;line-height:1.5}"
         "h2{margin-bottom:0.2em}.warn{color:#b00}.ok{color:#080}</style>"
         "</head><body>"
@@ -190,10 +190,20 @@ static void handle_root() {
         "<input type=\"submit\" value=\"Apply\">"
         "</form>"
 
+        "<script>"
+        "var wattsFieldFocused=false;"
+        "document.addEventListener('DOMContentLoaded',function(){"
+        "var w=document.querySelector('input[name=w]');"
+        "w.addEventListener('focus',function(){wattsFieldFocused=true;});"
+        "w.addEventListener('blur',function(){wattsFieldFocused=false;});"
+        "});"
+        "setTimeout(function(){if(!wattsFieldFocused){location.reload();}},5000);"
+        "</script>"
+
         "</body></html>",
 
         decision_reason_str(s_last_decision),
-        surplusW >= 0 ? surplusW : -surplusW, surplusW >= 0 ? "exporting" : "importing", settleNote,
+        fabsf(surplusW), surplusW >= 0 ? "exporting" : "importing", settleNote,
         s_last_target_amps,
 
         cpModeStr,
