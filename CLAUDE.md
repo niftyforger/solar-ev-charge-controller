@@ -87,12 +87,17 @@ Board: Freenove ESP32-S3-WROOM, mounted on the Freenove ESP32-S3 breakout board 
 PlatformIO project, `env:freenove_esp32_s3_wroom`, framework `arduino`. Builds clean as of this writing (`pio run`, zero warnings). Layout:
 
 - `include/config.h` — pins, control-loop constants, thresholds. Anything still marked TBD/placeholder here corresponds 1:1 to an item in "Open questions" below.
-- `include/secrets.h` (gitignored, template in `secrets.example.h`) — WiFi credentials + inverter IP. Must be edited before flashing.
+- `include/secrets.h` (gitignored, template in `secrets.example.h`) — WiFi credentials, inverter IP, and the shared OTA/control-page password. Must be edited before flashing.
 - `src/shared_state.*` — the Core0↔Core1 bridge: an `xQueueOverwrite` queue (length 1) for the target-amps command, plus a mutex-protected status struct in each direction. Core 1's side always uses zero-timeout mutex/queue takes so a contended mutex can never stall the real-time task.
 - `src/modbus_tcp_client.*` — hand-rolled minimal Modbus TCP client (no external lib): short-lived connection per poll rather than a held-open socket, since the WiNet-S gateway's concurrent-connection support is unconfirmed.
-- `src/solar_control.*` — Core 0: WiFi connect/reconnect, poll loop, the step-limited/settling-gated control law.
+- `src/solar_control.*` — Core 0: WiFi connect/reconnect, poll loop, the step-limited/settling-gated control law, OTA, and the sim-mode control page (see below).
 - `src/status_display.*` — Core 0: LCD refresh, its own task so a stuck I2C bus can't touch the control loop.
 - `src/cp_interceptor.*` — Core 1: GPIO-interrupt edge capture, RMT-generated clamp waveform, the `BYPASS`/`ACTIVE` × `OSCILLATING`/`STANDBY` state machine, K1 drive, task watchdog.
+
+### OTA & simulation mode
+
+- **OTA**: `ArduinoOTA` starts once Core 0's WiFi connects (`solar_control.cpp`), password-protected via `OTA_PASSWORD` in `secrets.h`. Lets firmware be reflashed over the LAN once the board is mounted near the Jueclat, without pulling it for USB access. Because Core 0 blocks on flash-writing during an actual OTA push, the Modbus/sim poll loop pauses for the duration; if a push runs longer than `STALE_DATA_TIMEOUT_MS` (60s), Core 1's existing stale-data fail-safe engages and bypasses to native pass-through mid-update — expected behavior, not a fault to avoid.
+- **Simulation mode**: for bench/night-time development when there's no real solar export to test against. A small HTTP control page (same `OTA_PASSWORD`, HTTP Basic Auth) is served at `http://<device-ip>/` once WiFi is up, letting you toggle between Real (actual Modbus reads) and Simulated (a value you set from the page) and adjust the simulated watts live. This is a runtime, network-reachable toggle rather than a physical jumper — accepted deliberately, since the CP interceptor's hardware topology already bounds what bad/malicious simulated data can do (it can only ever clip current down or fall back to native pass-through, never raise it above the Jueclat's native offer — see "Inherent fail-safe properties" below). Backed by `SolarStatus.simulated`; the status LCD's bottom line shows `SIM` in place of the Modbus-health field whenever active. Stale-data fail-safe testing still requires real hardware (stage 3 below) — sim mode keeps `last_poll_success_ms` advancing on its own, so it doesn't exercise that path.
 
 Not yet bench-validated — matches stage 1 of the plan below (CP simulator, no Jueclat/vehicle) as the next step.
 
