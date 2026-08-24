@@ -239,16 +239,42 @@ static void handle_set() {
     s_web_server.send(302, "text/plain", "");
 }
 
-static void start_network_services() {
+// Route/callback registration: allocates handler objects (WebServer::on()
+// appends a new FunctionRequestHandler to an internal linked list every
+// call, never replacing an existing one), so this must run exactly once for
+// the process lifetime - repeating it on every WiFi reconnect would leak a
+// handler each time. Safe to call before WiFi/services are up; it only
+// registers callbacks, it doesn't bind any socket.
+static void register_network_services() {
     ArduinoOTA.setHostname(WIFI_HOSTNAME);
     ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.onStart([]() { Serial.println("OTA: update starting"); });
     ArduinoOTA.onEnd([]() { Serial.println("OTA: update complete"); });
     ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA: error %u\n", error); });
-    ArduinoOTA.begin();
 
     s_web_server.on("/", HTTP_GET, handle_root);
     s_web_server.on("/set", HTTP_GET, handle_set);
+}
+
+// Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
+// whatever WiFi connection is current. Unlike register_network_services()
+// above, this IS meant to be called again after every WiFi drop/reconnect -
+// see the call site. ArduinoOTA.begin() is a no-op if it thinks it's
+// already initialized (guarded by an internal _initialized flag - checked
+// directly in this version's ArduinoOTA.cpp), so without an explicit end()
+// first, its UDP socket stays bound to the old (torn-down) network
+// interface forever after a reconnect - the web UI/OTA becoming
+// permanently unreachable after any WiFi hiccup, until a full power cycle,
+// while Modbus (a fresh short-lived socket every poll) keeps working, was
+// traced to exactly this. WebServer::begin() already self-closes its
+// previous listener internally, so it doesn't strictly need the explicit
+// close() below, but it's included for symmetry/clarity and because
+// close() on a never-started server is a harmless no-op either way.
+static void start_network_services() {
+    ArduinoOTA.end();
+    s_web_server.close();
+
+    ArduinoOTA.begin();
     s_web_server.begin();
 }
 
@@ -256,6 +282,7 @@ void solar_control_task(void *pvParameters) {
     (void)pvParameters;
 
     connect_wifi();
+    register_network_services();
 
     IPAddress inverterIp;
     inverterIp.fromString(INVERTER_IP_ADDR);
@@ -270,7 +297,22 @@ void solar_control_task(void *pvParameters) {
     for (;;) {
         uint32_t now = millis();
 
+        // Liveness signal for Core 1's independent recovery watchdog - see
+        // shared_state_heartbeat_solar_task() and the check in
+        // cp_interceptor_task(). Placed at the top of the loop so a hang
+        // anywhere below it (WiFi/OTA/WebServer/Modbus) is what actually
+        // gets caught, rather than being masked by a heartbeat that kept
+        // updating right up until the hang.
+        shared_state_heartbeat_solar_task();
+
         if (WiFi.status() != WL_CONNECTED) {
+            // Drop servicesStarted so the reconnect branch below re-runs
+            // start_network_services() once WiFi comes back - see that
+            // function's comment for why a stale ArduinoOTA/WebServer
+            // binding left over from before the drop won't recover on its
+            // own otherwise. Harmless to set repeatedly while already
+            // disconnected.
+            servicesStarted = false;
             if (now - lastWifiAttemptMs >= WIFI_RECONNECT_INTERVAL_MS) {
                 lastWifiAttemptMs = now;
                 connect_wifi();

@@ -5,24 +5,113 @@
 #include <Arduino.h>
 #include <driver/rmt.h>
 #include <driver/gpio.h>
+#include <driver/timer.h>
 #include <esp_timer.h>
 #include <esp_task_wdt.h>
+#include <esp_intr_alloc.h>
+#include <esp_system.h>
 
-struct EdgeEvent {
-    int64_t t_us;
-    uint8_t level; // 1 = rising, 0 = falling
-};
+// Low-level (register-only, force-inlined) HAL headers - see the "fourth
+// deviation" comment block below cp_hw_init() for why these replace the
+// driver/gpio.h, driver/timer.h and driver/rmt.h calls specifically inside
+// the two hot-path ISRs (cp_sense_isr/assert_timer_isr and the
+// schedule_clamp_ticks() helper they call). Those driver-level calls stay in
+// use everywhere else (cp_hw_init()'s one-time setup, task context) since
+// they're not IRAM/ISR-restricted there.
+#include <hal/gpio_ll.h>
+#include <hal/rmt_ll.h>
+#include <hal/timer_ll.h>
 
-static QueueHandle_t s_edge_queue = nullptr;
+// Legacy hardware timer group used to schedule the clamp-assert instant.
+// Fires assert_timer_isr() directly in interrupt context - see the comment
+// above assert_timer_isr() for why this replaced an esp_timer one-shot.
+#define CP_CLAMP_TIMER_GROUP    TIMER_GROUP_0
+#define CP_CLAMP_TIMER_IDX      TIMER_0
 
+// --- Task ("planning") -> ISR ("execution") handoff, all Core 1-local ---
+// cp_interceptor_task recomputes these on its own cadence (CP_NOTIFY_WAIT_MS)
+// from targetAmps/nativePeriodUs/nativeHighUs, doing all the floating-point
+// duty/timing math. cp_sense_isr() just applies them - see cp_sense_isr()'s
+// comment for why no floating point runs there. Write order on the task side
+// is ticks/clampEnabled first, dutyState last, so the ISR can never observe
+// dutyState==CP_OSCILLATING paired with stale/zero clamp parameters.
+static volatile SystemMode s_mode = MODE_BYPASS;
+static volatile CpDutyState s_dutyState = CP_STANDBY;
+static volatile bool s_clampEnabled = false;
+static volatile uint32_t s_assertOffsetTicks = 0; // hw timer ticks, 1us each
+static volatile uint32_t s_holdTicksRmt = 0;       // RMT ticks, 0.1us each
+
+// --- ISR -> task direction: opportunistically-learned native waveform ---
+// Updated only by cp_sense_isr() (pure integer arithmetic on edge
+// timestamps); read by the task each planning pass.
+static volatile uint32_t s_nativePeriodUs = 1000; // 1kHz nominal until measured
+static volatile uint32_t s_nativeHighUs = 0;
+static volatile bool s_nativeHighKnown = false;
+
+// ISR-internal only - touched solely within cp_sense_isr()'s own sequential
+// execution (GPIO ISR isn't reentrant here), so these don't need volatile.
+static int64_t s_lastRiseUs = -1;
+static bool s_clampedThisCycle = false;
+
+// Set by schedule_clamp_ticks() just before arming the alarm, read back by
+// assert_timer_isr() when it fires. Single in-flight clamp at a time, same
+// as the RMT channel itself only ever holds one pending waveform.
+static volatile uint32_t s_pendingHoldTicks = 0;
+
+static bool IRAM_ATTR assert_timer_isr(void *arg);
+static void IRAM_ATTR schedule_clamp_ticks(uint32_t assertOffsetTicks, uint32_t holdTicksRmt);
+
+// Rising edge: measure the native period (pure integer), then - if the
+// task's last planning pass says to clamp this cycle - arm the hardware
+// timer immediately, right here in interrupt context. This is the entire
+// timing-critical path now: no queue, no task wakeup, nothing between the
+// real GPIO transition and the timer being armed. Falling edge: opportunistic
+// native high-time learning, same rule as before (skip cycles we clamped,
+// since that edge is our own MOSFET, not the Jueclat's).
+//
+// Deliberately does ZERO floating-point/double arithmetic. ESP32-S3's Xtensa
+// FreeRTOS port saves/restores the floating-point coprocessor lazily, per
+// task, on context switch - not on arbitrary interrupt entry/exit. Using
+// hardware FP here could silently corrupt in-flight FP state belonging to
+// whatever this ISR interrupts (cp_interceptor_task's own double math, most
+// likely), an intermittent, hard-to-trace corruption bug rather than a clean
+// crash. All duty%/timing-offset math (which genuinely needs doubles) is
+// done in cp_interceptor_task instead, at its own cadence, producing plain
+// integer tick counts this ISR just applies.
 static void IRAM_ATTR cp_sense_isr(void *arg) {
-    EdgeEvent ev;
-    ev.t_us = esp_timer_get_time();
-    ev.level = gpio_get_level((gpio_num_t)CP_PWM_SENSE_GPIO);
-    BaseType_t higherPriorityWoken = pdFALSE;
-    xQueueSendFromISR(s_edge_queue, &ev, &higherPriorityWoken);
-    if (higherPriorityWoken == pdTRUE) {
-        portYIELD_FROM_ISR();
+    (void)arg;
+    int64_t nowUs = esp_timer_get_time();
+    // Raw register read, not gpio_get_level(): this ISR now runs with
+    // ESP_INTR_FLAG_IRAM (see cp_hw_init()), so it must never call into
+    // flash-resident driver code - see the "fourth deviation" comment below.
+    int level = gpio_ll_get_level(&GPIO, (gpio_num_t)CP_PWM_SENSE_GPIO);
+
+    if (level == 1) {
+        if (s_lastRiseUs > 0) {
+            int64_t period = nowUs - s_lastRiseUs;
+            // NATIVE_PERIOD_MIN_US/MAX_US are compile-time double literals;
+            // the (int64_t) casts fold at compile time, so this stays a
+            // pure integer comparison at runtime.
+            if (period > (int64_t)NATIVE_PERIOD_MIN_US && period < (int64_t)NATIVE_PERIOD_MAX_US) {
+                s_nativePeriodUs = (uint32_t)period;
+            }
+        }
+        s_lastRiseUs = nowUs;
+
+        s_clampedThisCycle = false;
+
+        if (s_mode == MODE_ACTIVE && s_dutyState == CP_OSCILLATING && s_clampEnabled) {
+            schedule_clamp_ticks(s_assertOffsetTicks, s_holdTicksRmt);
+            s_clampedThisCycle = true;
+        }
+    } else {
+        if (!s_clampedThisCycle && s_lastRiseUs > 0) {
+            int64_t high = nowUs - s_lastRiseUs;
+            if (high > 0 && high < (int64_t)s_nativePeriodUs) {
+                s_nativeHighUs = (uint32_t)high;
+                s_nativeHighKnown = true;
+            }
+        }
     }
 }
 
@@ -44,7 +133,19 @@ static void cp_hw_init() {
     gpio_config(&relayConf);
     gpio_set_level((gpio_num_t)RELAY_K1_GPIO, 0); // de-energized until proven safe to run
 
-    gpio_install_isr_service(0);
+    // ESP_INTR_FLAG_IRAM (fourth deviation, 2026-08-24 - see the comment
+    // above assert_timer_isr()): an earlier attempt at this flag backfired,
+    // but that was under the second-deviation design, where this ISR's
+    // portYIELD_FROM_ISR() woke cp_interceptor_task to do the scheduling -
+    // resuming a task that runs plenty of ordinary (non-IRAM, flash-resident)
+    // code, e.g. gpio_set_level() for K1, while the cache could still be
+    // disabled. The third deviation already removed that task hop entirely
+    // (cp_sense_isr() does the scheduling itself, no yield, no queue); this
+    // ISR and everything it calls (schedule_clamp_ticks()) are now raw
+    // register access only (hal/gpio_ll.h, hal/timer_ll.h), so there is no
+    // remaining non-IRAM code on this path for the flag to expose. Same
+    // reasoning applies to the clamp timer ISR below.
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     gpio_isr_handler_add((gpio_num_t)CP_PWM_SENSE_GPIO, cp_sense_isr, nullptr);
 
     rmt_config_t rmtConf = {};
@@ -58,8 +159,43 @@ static void cp_hw_init() {
     rmtConf.tx_config.carrier_level = RMT_CARRIER_LEVEL_HIGH;
     rmtConf.tx_config.idle_output_en = true;
     rmtConf.tx_config.idle_level = RMT_IDLE_LEVEL_LOW; // clamp released = safe default
+    // NOT setting RMT_CHANNEL_FLAGS_AWARE_DFS: this build has no CONFIG_PM_ENABLE
+    // (stock Arduino-ESP32, no sdkconfig override), so the driver's PM-lock
+    // acquisition for that flag has nothing to attach to - caused a hard
+    // fault / boot loop on real hardware when tried. rmt_set_source_clk()
+    // below still pins APB as the source; DFS isn't active in this build
+    // anyway, so the flag isn't needed to keep the 10MHz tick assumption valid.
     rmt_config(&rmtConf);
     rmt_driver_install(CP_RMT_TX_CHANNEL, 0, 0);
+    rmt_set_source_clk(CP_RMT_TX_CHANNEL, RMT_BASECLK_APB); // pin the clock the RMT tick math assumes
+
+    // Free-running hardware timer, alarm-triggered to fire assert_timer_isr()
+    // at the intended assert instant. Superseded an esp_timer one-shot
+    // (ESP_TIMER_TASK dispatch, since ESP_TIMER_ISR isn't available in this
+    // build - CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD is unset) because
+    // that dispatch went through a FreeRTOS task wakeup - real jitter
+    // (110-338us, bench-measured 2026-08-24) from scheduling variance, worse
+    // because the esp_timer task isn't core-pinned and could land on Core 0
+    // while it's busy with WiFi/Modbus/OTA. timer_isr_callback_add() runs
+    // assert_timer_isr() directly in interrupt context instead - no task
+    // wakeup in the loop at all. One-time setup here (timer_init() etc.)
+    // stays on the regular driver/timer.h API - it's task-context, not
+    // time-critical. ESP_INTR_FLAG_IRAM alloc flag (fourth deviation,
+    // 2026-08-24): see the gpio_install_isr_service comment above and the
+    // block above assert_timer_isr() for why this is now safe (no non-IRAM
+    // code left on the fired-ISR path) and why it was needed (closing the
+    // flash-cache-disable-deferral jitter gap).
+    timer_config_t clampTimerConfig = {};
+    clampTimerConfig.alarm_en = TIMER_ALARM_DIS;
+    clampTimerConfig.counter_en = TIMER_PAUSE;
+    clampTimerConfig.intr_type = TIMER_INTR_LEVEL;
+    clampTimerConfig.counter_dir = TIMER_COUNT_UP;
+    clampTimerConfig.auto_reload = TIMER_AUTORELOAD_DIS;
+    clampTimerConfig.divider = 80; // 80MHz APB / 80 = 1MHz -> 1us/tick
+    timer_init(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX, &clampTimerConfig);
+    timer_set_counter_value(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX, 0);
+    timer_isr_callback_add(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX, assert_timer_isr, nullptr, ESP_INTR_FLAG_IRAM);
+    timer_start(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX);
 
     analogReadResolution(12);
     analogSetPinAttenuation(CP_STATE_ADC_GPIO, ADC_11db);
@@ -73,36 +209,82 @@ static ConnectorState read_connector_state() {
     return CONN_STATE_FAULT;
 }
 
-// Arms the RMT-generated clamp pulse for the cycle currently in progress:
-// held low (released) for assertOffsetUs after the rising edge, then high
-// (clamped) for holdUs, then released again by the driver's configured idle
-// output - the release edge is hardware-guaranteed even if this task is
-// delayed before the next cycle.
-static void arm_clamp(double assertOffsetUs, double holdUs) {
-    const double ticksPerUs = 10.0; // RMT_CLK_DIV=8 -> 80MHz/8 = 10MHz
+// Beginning-of-struct pointer for TIMER_GROUP_0/1, matching CP_CLAMP_TIMER_GROUP.
+// TIMER_LL_GET_HW() is a compile-time ternary on a constant here, not a
+// runtime branch/lookup.
+#define CP_CLAMP_TIMER_HW  (TIMER_LL_GET_HW((int)CP_CLAMP_TIMER_GROUP))
 
-    if (assertOffsetUs < 0) assertOffsetUs = 0;
-    if (holdUs < 0) holdUs = 0;
+// Fires at the intended assert instant (armed by schedule_clamp_ticks()
+// below), directly in interrupt context - no FreeRTOS task wakeup in this
+// path.
+//
+// Fourth deviation (bench-tested 2026-08-24, same day as the recalibration
+// above): registered with ESP_INTR_FLAG_IRAM (see cp_hw_init()), so this and
+// cp_sense_isr() now keep running even inside a flash-cache-disable window
+// (WiFi/NVS activity elsewhere) instead of being deferred until it ends -
+// that deferral was the dominant source of the 75-166us dispatch jitter
+// measured against the third deviation (queue-free, direct-ISR-arm) design.
+// The IDF docs for timer_isr_callback_add()/gpio_isr_handler_add() are
+// explicit that an ESP_INTR_FLAG_IRAM handler "cannot call other timer
+// APIs... use direct register access" - so every call in this function and
+// in schedule_clamp_ticks()/cp_sense_isr() had to move off the driver-level
+// driver/rmt.h and driver/timer.h calls (rmt_write_items(),
+// timer_group_clr_intr_status_in_isr(), timer_set_alarm() etc. - all
+// flash-resident, non-IRAM) onto the force-inlined, register-only hal/*_ll.h
+// equivalents, which carry no such restriction since they compile directly
+// into this IRAM_ATTR function's own IRAM-resident body.
+//
+// Writes a single RMT item that asserts (HIGH) immediately and releases
+// after holdTicks - the hold duration lives in the item's *second* segment
+// (duration1), which bench testing showed (under the pre-IRAM design) is
+// honored accurately even when re-armed every ~1ms; the *first* segment is
+// kept to the minimum 1 tick rather than depended on for timing, since that
+// slot was the one found unreliable. A trailing zeroed item marks
+// end-of-data for the RMT hardware (mirrors what rmt_write_items() itself
+// writes past the caller's items). Idle-level release is still
+// hardware-guaranteed (idle_output_en + idle_level=LOW) even if this ISR is
+// ever deferred past the native falling edge.
+static bool IRAM_ATTR assert_timer_isr(void *arg) {
+    (void)arg;
+    timer_ll_clear_intr_status(CP_CLAMP_TIMER_HW, CP_CLAMP_TIMER_IDX);
+    // One-shot: the alarm stays disabled after firing (auto_reload is off)
+    // until schedule_clamp_ticks() arms it again for the next cycle -
+    // nothing to re-enable here.
 
-    uint32_t assertTicks = (uint32_t)(assertOffsetUs * ticksPerUs);
-    uint32_t holdTicks = (uint32_t)(holdUs * ticksPerUs);
-    if (assertTicks < 1) assertTicks = 1;
-    if (holdTicks < 1) holdTicks = 1;
-    if (assertTicks > 32767) assertTicks = 32767;
-    if (holdTicks > 32767) holdTicks = 32767;
+    rmt_item32_t items[2];
+    items[0].level0 = 0; // matches idle (released) - minimal, not depended on for timing
+    items[0].duration0 = 1;
+    items[0].level1 = 1; // assert - the duration that matters, kept in the reliable slot
+    items[0].duration1 = s_pendingHoldTicks;
+    items[1].val = 0; // end-of-data marker for the RMT hardware
 
-    rmt_item32_t items[1];
-    items[0].level0 = 0;
-    items[0].duration0 = assertTicks;
-    items[0].level1 = 1;
-    items[0].duration1 = holdTicks;
-    rmt_write_items(CP_RMT_TX_CHANNEL, items, 1, false);
+    rmt_ll_tx_reset_pointer(&RMT, CP_RMT_TX_CHANNEL);
+    rmt_ll_write_memory(&RMTMEM, CP_RMT_TX_CHANNEL, items, 2, 0);
+    rmt_ll_tx_start(&RMT, CP_RMT_TX_CHANNEL);
+
+    return false; // no FreeRTOS task to wake - nothing queued/notified from here
+}
+
+// Arms the clamp for holdTicksRmt (RMT ticks, 0.1us each), timed to land
+// assertOffsetTicks (hardware timer ticks, 1us each) from now. Pure integer -
+// called from cp_sense_isr(), see its comment for why. See assert_timer_isr()
+// for why the delay itself is a hardware timer alarm rather than encoded in
+// the RMT item, and for why this now uses hal/timer_ll.h instead of
+// driver/timer.h.
+static void IRAM_ATTR schedule_clamp_ticks(uint32_t assertOffsetTicks, uint32_t holdTicksRmt) {
+    s_pendingHoldTicks = holdTicksRmt;
+
+    timer_ll_set_alarm_enable(CP_CLAMP_TIMER_HW, CP_CLAMP_TIMER_IDX, false); // disarm any still-pending previous alarm first
+    uint64_t now = 0;
+    timer_ll_get_counter_value(CP_CLAMP_TIMER_HW, CP_CLAMP_TIMER_IDX, &now);
+    uint64_t alarmVal = now + (uint64_t)assertOffsetTicks;
+    timer_ll_set_alarm_value(CP_CLAMP_TIMER_HW, CP_CLAMP_TIMER_IDX, alarmVal);
+    timer_ll_set_alarm_enable(CP_CLAMP_TIMER_HW, CP_CLAMP_TIMER_IDX, true);
 }
 
 void cp_interceptor_task(void *pvParameters) {
     (void)pvParameters;
 
-    s_edge_queue = xQueueCreate(CP_EDGE_QUEUE_LEN, sizeof(EdgeEvent));
     cp_hw_init();
     esp_task_wdt_add(NULL);
 
@@ -110,22 +292,12 @@ void cp_interceptor_task(void *pvParameters) {
     CpDutyState dutyState = CP_STANDBY;
     bool bootstrapped = false;
     bool stale = true;
-
     float targetAmps = 0.0f;
-    int64_t lastRiseUs = -1;
-    double nativePeriodUs = 1000.0;
-    double nativeHighUs = 0.0;
-    bool nativeHighKnown = false;
-    bool clampedThisCycle = false;
-    float appliedDutyPct = 0.0f;
 
     int64_t lastStaleCheckUs = 0;
     int64_t lastStatusPublishUs = 0;
 
     for (;;) {
-        EdgeEvent ev;
-        BaseType_t got = xQueueReceive(s_edge_queue, &ev, pdMS_TO_TICKS(CP_NOTIFY_WAIT_MS));
-
         float qAmps;
         if (xQueueReceive(g_target_amps_queue, &qAmps, 0) == pdTRUE) {
             targetAmps = qAmps;
@@ -139,6 +311,20 @@ void cp_interceptor_task(void *pvParameters) {
             SolarStatus solar;
             bool have = shared_state_try_get_solar_status(solar);
             stale = !have || (millis() - solar.last_poll_success_ms > STALE_DATA_TIMEOUT_MS);
+
+            // Independent recovery watchdog for a wedged Core 0 - see
+            // SOLAR_TASK_HEARTBEAT_TIMEOUT_MS in config.h for why this is
+            // separate from CP_TASK_WDT_TIMEOUT_MS/esp_task_wdt above. The
+            // `stale` path already fails the CP task safely open (bypass to
+            // native pass-through) the moment Core 0 stops publishing fresh
+            // polls; this goes one step further and actually recovers the
+            // system automatically, rather than leaving it bypassed until
+            // someone notices and power-cycles the board.
+            if (shared_state_solar_task_heartbeat_age_ms() > SOLAR_TASK_HEARTBEAT_TIMEOUT_MS) {
+                Serial.println("solar_control_task heartbeat stale - Core 0 appears wedged, restarting");
+                Serial.flush();
+                esp_restart();
+            }
         }
 
         SystemMode desiredMode = (bootstrapped && !stale) ? MODE_ACTIVE : MODE_BYPASS;
@@ -146,66 +332,84 @@ void cp_interceptor_task(void *pvParameters) {
             mode = desiredMode;
             gpio_set_level((gpio_num_t)RELAY_K1_GPIO, mode == MODE_ACTIVE ? 1 : 0);
         }
+        s_mode = mode;
 
-        if (got == pdTRUE) {
-            if (ev.level == 1) {
-                // Rising edge: Jueclat is starting a new cycle.
-                if (lastRiseUs > 0) {
-                    double period = (double)(ev.t_us - lastRiseUs);
-                    if (period > NATIVE_PERIOD_MIN_US && period < NATIVE_PERIOD_MAX_US) {
-                        nativePeriodUs = period;
-                    }
-                }
-                lastRiseUs = ev.t_us;
+        // Planning pass: all floating-point duty/timing math lives here, at
+        // task cadence, never in cp_sense_isr(). nativePeriodUs/nativeHighUs
+        // are ISR-measured and may be up to one tick (CP_NOTIFY_WAIT_MS)
+        // stale here - immaterial, since a real ~1kHz oscillator's period
+        // doesn't move meaningfully on that timescale (same tolerance this
+        // codebase already accepts for Core 0's multi-second target-amps
+        // cadence).
+        uint32_t nativePeriodUs = s_nativePeriodUs;
+        uint32_t nativeHighUs = s_nativeHighUs;
+        bool nativeHighKnown = s_nativeHighKnown;
 
-                if (mode == MODE_ACTIVE) {
-                    if (targetAmps < MIN_CURRENT_A) {
-                        dutyState = CP_STANDBY;
-                    } else if (dutyState == CP_STANDBY && targetAmps < (MIN_CURRENT_A + HYSTERESIS_A)) {
-                        dutyState = CP_STANDBY;
-                    } else {
-                        dutyState = CP_OSCILLATING;
-                    }
-                } else {
-                    dutyState = CP_STANDBY;
-                }
-
-                clampedThisCycle = false;
-
-                if (mode == MODE_ACTIVE && dutyState == CP_OSCILLATING && nativeHighKnown) {
-                    float targetDutyPct = constrain(targetAmps * CP_DUTY_PCT_PER_AMP, CP_MIN_DUTY_PCT, CP_MAX_DUTY_PCT);
-                    double nativeDutyPct = nativeHighUs * 100.0 / nativePeriodUs;
-                    double effectiveDutyPct = min((double)targetDutyPct, nativeDutyPct);
-
-                    if (nativeDutyPct - effectiveDutyPct >= MIN_CLAMP_MARGIN_PCT) {
-                        double assertOffsetUs = nativePeriodUs * effectiveDutyPct / 100.0 - TX_DISPATCH_LATENCY_US;
-                        double holdUs = nativeHighUs - assertOffsetUs;
-                        arm_clamp(assertOffsetUs, holdUs);
-                        clampedThisCycle = true;
-                        appliedDutyPct = (float)effectiveDutyPct;
-                    } else {
-                        appliedDutyPct = (float)nativeDutyPct;
-                    }
-                } else if (mode == MODE_ACTIVE && dutyState == CP_OSCILLATING) {
-                    // Native duty not learned yet - fail toward pass-through
-                    // rather than guessing a clamp point.
-                    appliedDutyPct = 0.0f;
-                } else {
-                    appliedDutyPct = nativeHighKnown ? (float)(nativeHighUs * 100.0 / nativePeriodUs) : 0.0f;
-                }
+        // MIN_CURRENT_A (10% duty) is itself a fully valid, spec-legal CP
+        // signal, not a marginal one - there's no reason to withhold
+        // OSCILLATING right at the floor when approaching from STANDBY, so
+        // entry uses the bare floor with no extra margin. The hysteresis
+        // margin instead sits on the *exit* side: once already
+        // OSCILLATING, don't drop back to STANDBY until target falls
+        // meaningfully below the floor, so noise sitting right at
+        // MIN_CURRENT_A can't flap the clamp on/off every planning pass.
+        // (Bench-caught 2026-08-24: the previous version put the margin on
+        // entry instead - targetAmps had to clear MIN_CURRENT_A+HYSTERESIS_A
+        // before ever leaving STANDBY, so settling exactly at the 6.0A
+        // floor produced no clamp signal at all; only settling at 8.0A did.)
+        CpDutyState newDutyState;
+        if (mode == MODE_ACTIVE) {
+            if (dutyState == CP_OSCILLATING) {
+                newDutyState = (targetAmps < MIN_CURRENT_A - HYSTERESIS_A) ? CP_STANDBY : CP_OSCILLATING;
             } else {
-                // Falling edge. If we clamped this cycle, this transition is
-                // our own MOSFET asserting, not the Jueclat's real falling
-                // edge - don't use it to update the learned native duty.
-                if (!clampedThisCycle && lastRiseUs > 0) {
-                    double high = (double)(ev.t_us - lastRiseUs);
-                    if (high > 0 && high < nativePeriodUs) {
-                        nativeHighUs = high;
-                        nativeHighKnown = true;
-                    }
-                }
+                newDutyState = (targetAmps >= MIN_CURRENT_A) ? CP_OSCILLATING : CP_STANDBY;
             }
+        } else {
+            newDutyState = CP_STANDBY;
         }
+        dutyState = newDutyState;
+
+        bool clampEnabled = false;
+        uint32_t assertOffsetTicks = 0;
+        uint32_t holdTicksRmt = 0;
+        float appliedDutyPct = 0.0f;
+
+        if (mode == MODE_ACTIVE && dutyState == CP_OSCILLATING && nativeHighKnown) {
+            float targetDutyPct = constrain(targetAmps * CP_DUTY_PCT_PER_AMP, CP_MIN_DUTY_PCT, CP_MAX_DUTY_PCT);
+            double nativeDutyPct = (double)nativeHighUs * 100.0 / (double)nativePeriodUs;
+            double effectiveDutyPct = min((double)targetDutyPct, nativeDutyPct);
+
+            if (nativeDutyPct - effectiveDutyPct >= MIN_CLAMP_MARGIN_PCT) {
+                double assertOffsetUs = (double)nativePeriodUs * effectiveDutyPct / 100.0 - CLAMP_DISPATCH_LATENCY_US;
+                if (assertOffsetUs < 0) assertOffsetUs = 0;
+                double holdUs = (double)nativeHighUs - assertOffsetUs;
+                if (holdUs < 0) holdUs = 0;
+
+                uint32_t ht = (uint32_t)(holdUs * 10.0); // RMT: 0.1us/tick
+                if (ht < 1) ht = 1;
+                if (ht > 32767) ht = 32767;
+
+                assertOffsetTicks = (uint32_t)assertOffsetUs; // hw timer: 1us/tick
+                holdTicksRmt = ht;
+                clampEnabled = true;
+                appliedDutyPct = (float)effectiveDutyPct;
+            } else {
+                appliedDutyPct = (float)nativeDutyPct;
+            }
+        } else if (mode == MODE_ACTIVE && dutyState == CP_OSCILLATING) {
+            // Native duty not learned yet - fail toward pass-through rather
+            // than guessing a clamp point.
+            appliedDutyPct = 0.0f;
+        } else {
+            appliedDutyPct = nativeHighKnown ? (float)((double)nativeHighUs * 100.0 / (double)nativePeriodUs) : 0.0f;
+        }
+
+        // Publish ticks/clampEnabled before dutyState - see the file-level
+        // comment on this handoff for why the order matters.
+        s_assertOffsetTicks = assertOffsetTicks;
+        s_holdTicksRmt = holdTicksRmt;
+        s_clampEnabled = clampEnabled;
+        s_dutyState = dutyState;
 
         if (now - lastStatusPublishUs >= (int64_t)CP_STATUS_PUBLISH_MS * 1000) {
             lastStatusPublishUs = now;
@@ -213,11 +417,12 @@ void cp_interceptor_task(void *pvParameters) {
             status.mode = mode;
             status.duty_state = dutyState;
             status.connector_state = read_connector_state();
-            status.native_duty_pct = nativeHighKnown ? (float)(nativeHighUs * 100.0 / nativePeriodUs) : 0.0f;
+            status.native_duty_pct = nativeHighKnown ? (float)((double)nativeHighUs * 100.0 / (double)nativePeriodUs) : 0.0f;
             status.applied_duty_pct = appliedDutyPct;
             shared_state_try_publish_cp_status(status);
         }
 
         esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(CP_NOTIFY_WAIT_MS));
     }
 }
