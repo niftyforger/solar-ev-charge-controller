@@ -5,6 +5,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <string.h>
+#include <math.h>
 
 static const char *connector_state_str(ConnectorState s) {
     switch (s) {
@@ -41,7 +42,7 @@ void status_display_task(void *pvParameters) {
 
         lcd.setCursor(0, 0);
         if (solar.grid_power_w <= 0) {
-            snprintf(line, sizeof(line), "Export %5.0fW", -solar.grid_power_w);
+            snprintf(line, sizeof(line), "Export %5.0fW", fabsf(solar.grid_power_w));
         } else {
             snprintf(line, sizeof(line), "Import %5.0fW", solar.grid_power_w);
         }
@@ -51,7 +52,7 @@ void status_display_task(void *pvParameters) {
         lcd.setCursor(0, 1);
         if (cp.mode == MODE_ACTIVE && cp.duty_state == CP_OSCILLATING) {
             float amps = cp.applied_duty_pct / CP_DUTY_PCT_PER_AMP;
-            snprintf(line, sizeof(line), "Tgt %4.1fA Duty%4.1f%%", amps, cp.applied_duty_pct);
+            snprintf(line, sizeof(line), "Tgt %4.1fA Duty %4.1f%%", amps, cp.applied_duty_pct);
         } else {
             snprintf(line, sizeof(line), "Tgt --.-A Duty --.-%%");
         }
