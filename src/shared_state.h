@@ -24,6 +24,7 @@ struct SolarStatus {
     uint32_t last_poll_success_ms;
     bool wifi_connected;
     bool modbus_ok;
+    bool simulated;               // true when fed from the sim-mode control page, not real Modbus
 };
 
 struct CpStatus {
