@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio device *)",
+      "Bash(pio run *)",
+      "WebSearch",
+      "Bash(find / -path \"*/espressif32/*/tools/sdk/esp32s3/include/driver/include/driver/timer.h\" 2>/dev/null | head -5)",
+      "Read(//c//**)"
+    ]
+  }
+}

@@ -5,10 +5,17 @@ QueueHandle_t g_target_amps_queue = nullptr;
 static SemaphoreHandle_t s_status_mutex = nullptr;
 static SolarStatus s_solar_status = {0.0f, 0, false, false};
 static CpStatus s_cp_status = {MODE_BYPASS, CP_STANDBY, CONN_STATE_FAULT, 0.0f, 0.0f};
+static volatile uint32_t s_solar_task_heartbeat_ms = 0;
 
 void shared_state_init() {
     g_target_amps_queue = xQueueCreate(1, sizeof(float));
     s_status_mutex = xSemaphoreCreateMutex();
+    // Baseline to "now", not 0: solar_control_task hasn't run its first loop
+    // iteration yet at this point (called from setup(), before
+    // xTaskCreatePinnedToCore()), so a 0 baseline would read as an already
+    // ancient heartbeat and could trip the Core 1 watchdog check before
+    // Core 0 ever gets a chance to run.
+    s_solar_task_heartbeat_ms = millis();
 }
 
 void shared_state_set_target_amps(float amps) {
@@ -56,4 +63,12 @@ CpStatus shared_state_get_cp_status_blocking() {
         xSemaphoreGive(s_status_mutex);
     }
     return out;
+}
+
+void shared_state_heartbeat_solar_task() {
+    s_solar_task_heartbeat_ms = millis();
+}
+
+uint32_t shared_state_solar_task_heartbeat_age_ms() {
+    return millis() - s_solar_task_heartbeat_ms;
 }

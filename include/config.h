@@ -51,14 +51,42 @@
 // no meaningful effect.
 #define MIN_CLAMP_MARGIN_PCT     0.5f
 
-// Systematic compensation for the software dispatch latency between the
-// rising-edge ISR and the RMT hardware actually starting to output the
-// scheduled waveform. Placeholder - characterize and tune during bench
-// testing stage 1 (see CLAUDE.md open questions).
-#define TX_DISPATCH_LATENCY_US   3.0
+// Systematic compensation for the total latency between the rising-edge ISR
+// arming the hardware timer and the RMT hardware actually asserting the
+// clamp: cp_sense_isr() -> timer alarm -> assert_timer_isr() (genuine
+// interrupt context, no FreeRTOS task dispatch - see cp_interceptor.cpp) ->
+// raw RMT register write (rmt_ll_write_memory()/rmt_ll_tx_start()).
+//
+// History: 35.7us (calibrated against the superseded esp_timer/
+// ESP_TIMER_TASK mechanism, never re-verified after that path was replaced)
+// -> 10.7us (2026-08-24, first bench sample against the hardware-timer-
+// group-ISR path: target 10.0% duty, ~1kHz native period, typical measured
+// GPIO5-to-GPIO6 delta 75us against a 100us target, so old constant
+// (35.7) was over-subtracting by 25us: 35.7 - 25 = 10.7).
+//
+// Recalibrated again 2026-08-24, same day, after the ISRs were rewritten to
+// raw register access (hal/gpio_ll.h, hal/rmt_ll.h, hal/timer_ll.h) and
+// ESP_INTR_FLAG_IRAM (see cp_hw_init()/assert_timer_isr() in
+// cp_interceptor.cpp) - that rewrite removed the flash-resident driver call
+// overhead the 10.7us figure was measured against, so the mean shifted:
+// same 10.0% duty point now measured 95us against the still-100us target,
+// 5us short. Corrected value = 10.7 - 5 = 5.7us.
+//
+// Still only single bench samples at one duty point each time - re-derive
+// with more samples/duty points and a scope once real hardware (not the
+// bench simulator) is available.
+#define CLAMP_DISPATCH_LATENCY_US   5.7
 
-// Hysteresis band for re-entering OSCILLATING from STANDBY once surplus
-// recovers above the minimum-current floor. Placeholder - tune empirically.
+// Hysteresis band for *dropping back* to STANDBY once already OSCILLATING:
+// target must fall below MIN_CURRENT_A - HYSTERESIS_A, not just below
+// MIN_CURRENT_A, so noise sitting right at the floor can't flap the clamp
+// on/off every planning pass. Entering OSCILLATING from STANDBY uses the
+// bare MIN_CURRENT_A floor with no margin - 10% duty is itself a fully
+// valid signal, not a marginal one, so there's no reason to withhold it.
+// (An earlier version put the margin on entry instead, which meant
+// settling exactly at the 6.0A floor produced no clamp signal at all -
+// caught bench-side 2026-08-24; see cp_interceptor.cpp.) Placeholder value
+// - tune empirically.
 #define HYSTERESIS_A             1.0f
 
 // ---------------------------------------------------------------------------
@@ -83,11 +111,31 @@
 // ---------------------------------------------------------------------------
 // Core 1 CP task timing
 // ---------------------------------------------------------------------------
-#define CP_EDGE_QUEUE_LEN         16
-#define CP_NOTIFY_WAIT_MS         100    // also doubles as "no oscillation" poll rate
+// cp_interceptor_task's planning-loop cadence (vTaskDelay). Not in the
+// timing-critical path - cp_sense_isr() applies the clamp plan directly on
+// each rising edge, independent of this loop. See cp_interceptor.cpp.
+#define CP_NOTIFY_WAIT_MS         100
 #define CP_STALE_CHECK_MS         1000
 #define CP_STATUS_PUBLISH_MS      200
 #define CP_TASK_WDT_TIMEOUT_MS    3000
+
+// Independent recovery watchdog for solar_control_task (Core 0), checked by
+// Core 1 alongside its own CP_STALE_CHECK_MS cadence - see
+// shared_state_heartbeat_solar_task()/shared_state_solar_task_heartbeat_age_ms()
+// and the check in cp_interceptor_task(). Deliberately NOT the same
+// esp_task_wdt_add() mechanism as CP_TASK_WDT_TIMEOUT_MS above: that's a
+// single global ESP-IDF TWDT period shared by every registered task, and
+// solar_control_task legitimately blocks far longer than 3s during an
+// ArduinoOTA push (Core 0 blocks on flash writes for the whole transfer -
+// see "OTA & simulation mode" in CLAUDE.md, which already treats pushes
+// approaching STALE_DATA_TIMEOUT_MS/60s as unremarkable). Registering this
+// task on the CP task's tight watchdog would abort every real OTA update;
+// this separate, longer, Core-1-driven check exists so a genuinely wedged
+// Core 0 (WiFi/lwIP/WebServer hang - the known failure mode this addresses)
+// still self-recovers via esp_restart(), without weakening the CP task's
+// own watchdog protection at all. Sized comfortably above any expected OTA
+// duration for this firmware's image size on local WiFi.
+#define SOLAR_TASK_HEARTBEAT_TIMEOUT_MS 120000UL
 
 // ---------------------------------------------------------------------------
 // Core 0 solar control loop
