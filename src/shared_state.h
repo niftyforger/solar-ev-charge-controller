@@ -57,3 +57,16 @@ SolarStatus shared_state_get_solar_status_blocking();
 // happens to be mid-I2C-transaction can never delay the CP task.
 bool shared_state_try_publish_cp_status(const CpStatus &s); // non-blocking
 CpStatus shared_state_get_cp_status_blocking();
+
+// --- Core 0 -> Core 1: solar_control_task liveness heartbeat -------------
+// A plain volatile word (millis() timestamp), not mutex-protected: a 32-bit
+// aligned read/write is already atomic on this platform, and this is a
+// liveness signal, not data that needs a consistent multi-field snapshot -
+// the same pattern cp_interceptor.cpp already uses for its Core0/Core1
+// mode/duty-state volatiles. Core 0 calls the setter once per loop
+// iteration; Core 1 polls the getter on its own cadence (see
+// SOLAR_TASK_HEARTBEAT_TIMEOUT_MS in config.h) to detect a wedged Core 0
+// (WiFi/lwIP/WebServer hang) and recover via esp_restart() - see
+// cp_interceptor_task().
+void shared_state_heartbeat_solar_task();
+uint32_t shared_state_solar_task_heartbeat_age_ms();
