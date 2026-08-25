@@ -3,8 +3,8 @@
 #include <Arduino.h>
 
 enum SystemMode {
-    MODE_BYPASS = 0,  // K1 de-energized, clamp leg physically disconnected
-    MODE_ACTIVE = 1,  // K1 energized, CP task is following target current
+    MODE_BYPASS = 0,  // clamp scheduling disabled in cp_sense_isr(); CLAMP_DRIVE never asserts
+    MODE_ACTIVE = 1,  // CP task is following target current; clamp may assert per duty state
 };
 
 enum CpDutyState {
