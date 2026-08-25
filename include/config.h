@@ -16,12 +16,15 @@
 // CP clamp drive output -> optocoupler -> MOSFET gate driver (RMT TX)
 #define CLAMP_DRIVE_GPIO       6
 
-// K1 relay coil driver transistor, active-high
-#define RELAY_K1_GPIO          7
-
-// Analog CP DC-level sense for connector state (A/B/C) discrimination.
-// Must be ADC1 (GPIO1-10).
-#define CP_STATE_ADC_GPIO      4
+// CP connector-state sense, CONNECTED_IN (post opto, digital 0/3.3V).
+// Per the CP interceptor schematic, this is no longer a raw analog read:
+// an LM393 dual comparator (U2) on the sense divider does the level
+// discrimination in hardware against two fixed references (REF_CONN
+// ~2.5V, REF_EDGE ~0.45V - see CLAUDE.md "CP interception circuit"),
+// and this GPIO just reads U2B's (CONNECTED_IN) digital output. No
+// longer needs to be ADC1-capable, but GPIO4 is kept to match the
+// physical tap already planned for it.
+#define CP_CONNECTED_SENSE_GPIO 4
 
 // Status LCD I2C bus (matches the bring-up example in examples/display/display.ino)
 #define I2C_SDA_PIN             8
@@ -90,17 +93,35 @@
 #define HYSTERESIS_A             1.0f
 
 // ---------------------------------------------------------------------------
-// Connector-state (A/B/C) ADC thresholds
+// Connector-state discrimination
 //
-// Placeholder millivolt breakpoints for the CP_STATE_ADC_GPIO divider/peak
-// detector. Exact resistor divider and comparator thresholds are an open
-// question in CLAUDE.md - confirm against real CP voltages (12V/9V/6V) with
-// a scope during bring-up and adjust these.
-// ---------------------------------------------------------------------------
-#define ADC_MV_STATE_A_MIN       2600   // ~12V CP -> highest divided level
-#define ADC_MV_STATE_B_MIN       1900   // ~9V CP
-#define ADC_MV_STATE_C_MIN       1200   // ~6V CP
-// Anything below ADC_MV_STATE_C_MIN is treated as FAULT/disconnected.
+// Level discrimination now happens in hardware (U2, LM393 dual comparator -
+// see CP_CONNECTED_SENSE_GPIO above and CLAUDE.md "CP interception
+// circuit"), not via ADC breakpoints in firmware. What's left in software
+// is combining CONNECTED_IN's level with EDGE_IN's (CP_PWM_SENSE_GPIO)
+// recent activity/level - see read_connector_state() in cp_interceptor.cpp.
+//
+// With a single CONNECTED_IN threshold (REF_CONN ~2.5V, sitting between
+// state A's ~12V and state B's ~9V) and a single EDGE_IN threshold
+// (REF_EDGE ~0.45V, sitting between state D's ~3V and state E's 0V), the
+// achievable resolution is four buckets, not the full six CP levels:
+//   A          - CONNECTED_IN reads "not connected"
+//   B          - connected, EDGE_IN steady-high, no recent toggling
+//   C (incl. D)- connected, EDGE_IN toggling recently (oscillating)
+//   FAULT (incl. E/F) - connected, EDGE_IN steady-low, no recent toggling
+// C/D and E/F are each conflated - the peak-amplitude difference between
+// them is exactly what a digital comparator discards. Accepted tradeoff:
+// D (ventilated charging) is unused by this vehicle/install, and E/F both
+// already map to "don't clamp" behaviourally, so the conflation doesn't
+// affect control-loop safety, only LCD/status granularity.
+//
+// CP_ACTIVITY_TIMEOUT_US is how long since the last rising edge before
+// read_connector_state() stops considering the line "currently
+// oscillating". Sized a few native periods above NATIVE_PERIOD_MAX_US so
+// normal jitter can't cause a false "not oscillating" read, while staying
+// far shorter than CP_STATUS_PUBLISH_MS so a real stop is reflected
+// promptly.
+#define CP_ACTIVITY_TIMEOUT_US   3000
 
 // ---------------------------------------------------------------------------
 // RMT (legacy driver/rmt.h - ESP-IDF 4.4 bundled with this platform version)

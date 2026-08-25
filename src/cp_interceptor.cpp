@@ -53,6 +53,16 @@ static volatile bool s_nativeHighKnown = false;
 static int64_t s_lastRiseUs = -1;
 static bool s_clampedThisCycle = false;
 
+// Truncated low 32 bits of the last rising-edge timestamp, published
+// volatile for read_connector_state() (task context, ~CP_STATUS_PUBLISH_MS
+// cadence) to check activity recency against CP_ACTIVITY_TIMEOUT_US.
+// Separate from s_lastRiseUs (int64_t, ISR-internal only) rather than making
+// that one volatile: a 64-bit value isn't atomically read/written on this
+// 32-bit core, and a plain 32-bit microsecond delta is all a few-millisecond
+// recency check needs - same reasoning as s_nativePeriodUs/s_nativeHighUs
+// above.
+static volatile uint32_t s_lastRiseUs32 = 0;
+
 // Set by schedule_clamp_ticks() just before arming the alarm, read back by
 // assert_timer_isr() when it fires. Single in-flight clamp at a time, same
 // as the RMT channel itself only ever holds one pending waveform.
@@ -97,6 +107,7 @@ static void IRAM_ATTR cp_sense_isr(void *arg) {
             }
         }
         s_lastRiseUs = nowUs;
+        s_lastRiseUs32 = (uint32_t)nowUs;
 
         s_clampedThisCycle = false;
 
@@ -124,22 +135,13 @@ static void cp_hw_init() {
     senseConf.intr_type = GPIO_INTR_ANYEDGE;
     gpio_config(&senseConf);
 
-    gpio_config_t relayConf = {};
-    relayConf.pin_bit_mask = (1ULL << RELAY_K1_GPIO);
-    relayConf.mode = GPIO_MODE_OUTPUT;
-    relayConf.pull_up_en = GPIO_PULLUP_DISABLE;
-    relayConf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    relayConf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&relayConf);
-    gpio_set_level((gpio_num_t)RELAY_K1_GPIO, 0); // de-energized until proven safe to run
-
     // ESP_INTR_FLAG_IRAM (fourth deviation, 2026-08-24 - see the comment
     // above assert_timer_isr()): an earlier attempt at this flag backfired,
     // but that was under the second-deviation design, where this ISR's
     // portYIELD_FROM_ISR() woke cp_interceptor_task to do the scheduling -
     // resuming a task that runs plenty of ordinary (non-IRAM, flash-resident)
-    // code, e.g. gpio_set_level() for K1, while the cache could still be
-    // disabled. The third deviation already removed that task hop entirely
+    // code while the cache could still be disabled. The third deviation
+    // already removed that task hop entirely
     // (cp_sense_isr() does the scheduling itself, no yield, no queue); this
     // ISR and everything it calls (schedule_clamp_ticks()) are now raw
     // register access only (hal/gpio_ll.h, hal/timer_ll.h), so there is no
@@ -197,16 +199,45 @@ static void cp_hw_init() {
     timer_isr_callback_add(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX, assert_timer_isr, nullptr, ESP_INTR_FLAG_IRAM);
     timer_start(CP_CLAMP_TIMER_GROUP, CP_CLAMP_TIMER_IDX);
 
-    analogReadResolution(12);
-    analogSetPinAttenuation(CP_STATE_ADC_GPIO, ADC_11db);
+    gpio_config_t connectedConf = {};
+    connectedConf.pin_bit_mask = (1ULL << CP_CONNECTED_SENSE_GPIO);
+    connectedConf.mode = GPIO_MODE_INPUT;
+    connectedConf.pull_up_en = GPIO_PULLUP_DISABLE;
+    connectedConf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    connectedConf.intr_type = GPIO_INTR_DISABLE; // polled from the task, not interrupt-driven
+    gpio_config(&connectedConf);
 }
 
+// Task-context only (called at CP_STATUS_PUBLISH_MS cadence, not from an
+// ISR), so plain driver/gpio.h calls are fine here - unlike cp_sense_isr()/
+// assert_timer_isr(), nothing here is IRAM-restricted.
+//
+// Assumed polarity, not yet bench-confirmed (see CLAUDE.md - flag alongside
+// the other CP-side polarity/threshold assumptions still pending a scope):
+// CP_CONNECTED_SENSE_GPIO reads HIGH when CONNECTED_IN's comparator (U2B)
+// sees SENSE above REF_CONN, i.e. state A (~12V, no vehicle); LOW for every
+// connected level (B/C/D/E/F all sit below REF_CONN). CP_PWM_SENSE_GPIO's
+// existing level convention (HIGH during the driven-high portion of a
+// cycle) is reused unchanged for the EDGE_IN reads below.
 static ConnectorState read_connector_state() {
-    uint32_t mv = analogReadMilliVolts(CP_STATE_ADC_GPIO);
-    if (mv >= ADC_MV_STATE_A_MIN) return CONN_STATE_A;
-    if (mv >= ADC_MV_STATE_B_MIN) return CONN_STATE_B;
-    if (mv >= ADC_MV_STATE_C_MIN) return CONN_STATE_C;
-    return CONN_STATE_FAULT;
+    bool notConnected = gpio_get_level((gpio_num_t)CP_CONNECTED_SENSE_GPIO) == 1;
+    if (notConnected) return CONN_STATE_A;
+
+    // Connected. dutyState is our own clamp *decision*, not a measurement
+    // of what the Jueclat is actually driving, so it can't tell us whether
+    // the line is really oscillating right now - use EDGE_IN activity
+    // recency instead (see CP_ACTIVITY_TIMEOUT_US in config.h).
+    uint32_t nowUs32 = (uint32_t)esp_timer_get_time();
+    bool oscillatingNow = (nowUs32 - s_lastRiseUs32) < (uint32_t)CP_ACTIVITY_TIMEOUT_US;
+    if (oscillatingNow) return CONN_STATE_C; // covers C and D - see config.h
+
+    // Connected, no recent EDGE_IN toggling: either B (steady ~9V) or a
+    // dead/fault line (E at 0V, F clamped near 0V) - CONNECTED_IN's single
+    // threshold can't tell these apart (both read "connected"), but
+    // EDGE_IN's idle *level* can, since B's ~9V sits above REF_EDGE while
+    // E/F's ~0V sits below it.
+    bool edgeIdleHigh = gpio_get_level((gpio_num_t)CP_PWM_SENSE_GPIO) == 1;
+    return edgeIdleHigh ? CONN_STATE_B : CONN_STATE_FAULT;
 }
 
 // Beginning-of-struct pointer for TIMER_GROUP_0/1, matching CP_CLAMP_TIMER_GROUP.
@@ -327,11 +358,7 @@ void cp_interceptor_task(void *pvParameters) {
             }
         }
 
-        SystemMode desiredMode = (bootstrapped && !stale) ? MODE_ACTIVE : MODE_BYPASS;
-        if (desiredMode != mode) {
-            mode = desiredMode;
-            gpio_set_level((gpio_num_t)RELAY_K1_GPIO, mode == MODE_ACTIVE ? 1 : 0);
-        }
+        mode = (bootstrapped && !stale) ? MODE_ACTIVE : MODE_BYPASS;
         s_mode = mode;
 
         // Planning pass: all floating-point duty/timing math lives here, at
