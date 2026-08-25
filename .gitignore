@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 include/secrets.h
+/schematic/CCS2_charge_limiter/CCS2_charge_limiter-backups
