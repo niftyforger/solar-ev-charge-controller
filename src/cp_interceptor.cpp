@@ -212,15 +212,15 @@ static void cp_hw_init() {
 // ISR), so plain driver/gpio.h calls are fine here - unlike cp_sense_isr()/
 // assert_timer_isr(), nothing here is IRAM-restricted.
 //
-// Assumed polarity, not yet bench-confirmed (see CLAUDE.md - flag alongside
-// the other CP-side polarity/threshold assumptions still pending a scope):
-// CP_CONNECTED_SENSE_GPIO reads HIGH when CONNECTED_IN's comparator (U2B)
-// sees SENSE above REF_CONN, i.e. state A (~12V, no vehicle); LOW for every
-// connected level (B/C/D/E/F all sit below REF_CONN). CP_PWM_SENSE_GPIO's
-// existing level convention (HIGH during the driven-high portion of a
-// cycle) is reused unchanged for the EDGE_IN reads below.
+// Bench-confirmed 2026-08-30: CP_CONNECTED_SENSE_GPIO reads LOW when
+// CONNECTED_IN's comparator (U2B) sees SENSE above REF_CONN, i.e. state A
+// (~12V, no vehicle); HIGH for every connected level (B/C/D/E/F all sit
+// below REF_CONN) - inverted from the originally-assumed polarity, per the
+// comparator/opto stage actually installed. CP_PWM_SENSE_GPIO's existing
+// level convention (HIGH during the driven-high portion of a cycle) is
+// reused unchanged for the EDGE_IN reads below.
 static ConnectorState read_connector_state() {
-    bool notConnected = gpio_get_level((gpio_num_t)CP_CONNECTED_SENSE_GPIO) == 1;
+    bool notConnected = gpio_get_level((gpio_num_t)CP_CONNECTED_SENSE_GPIO) == 0;
     if (notConnected) return CONN_STATE_A;
 
     // Connected. dutyState is our own clamp *decision*, not a measurement
