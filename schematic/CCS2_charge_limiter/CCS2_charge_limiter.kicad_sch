@@ -3790,6 +3790,17 @@
 				)
 			)
 		)
+		(property "Tolerance" "1%"
+			(at 67.31 50.8 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
 		(pin "1"
 			(uuid "783449b3-5c3a-4485-a0b0-cc17605c0232")
 		)
@@ -5859,6 +5870,17 @@
 				)
 			)
 		)
+		(property "Tolerance" "1%"
+			(at 33.02 71.12 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
 		(pin "1"
 			(uuid "7b2bcf12-0060-45b5-9e90-8f53e4425054")
 		)
@@ -6667,6 +6689,17 @@
 			)
 		)
 		(property "Description" "Resistor"
+			(at 33.02 60.96 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Tolerance" "1%"
 			(at 33.02 60.96 0)
 			(hide yes)
 			(show_name no)
