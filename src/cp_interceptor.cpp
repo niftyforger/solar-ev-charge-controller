@@ -79,6 +79,19 @@ static void IRAM_ATTR schedule_clamp_ticks(uint32_t assertOffsetTicks, uint32_t 
 // native high-time learning, same rule as before (skip cycles we clamped,
 // since that edge is our own MOSFET, not the Jueclat's).
 //
+// Bench-confirmed 2026-08-30: CP_PWM_SENSE_GPIO's comparator/opto stage is
+// inverted from the originally-assumed polarity (same fault as
+// CP_CONNECTED_SENSE_GPIO, already fixed in read_connector_state()) - the
+// raw GPIO reads LOW while the real CP line is in its positive lobe, HIGH
+// while it's in its negative lobe. So the real CP rising edge shows up here
+// as this GPIO's level==0, and the real falling edge as level==1 - the
+// branches below are correct for "real rising"/"real falling" as labeled,
+// only the level==0/level==1 condition needed to flip to match. (Previously
+// level==1 was mistaken for the real rising edge, which armed the clamp
+// timer off the real falling edge instead - reproduced on the bench as
+// CLAMP_DRIVE asserting a duty%-proportional delay after CP's real fall,
+// i.e. clamping into the negative half-cycle.)
+//
 // Deliberately does ZERO floating-point/double arithmetic. ESP32-S3's Xtensa
 // FreeRTOS port saves/restores the floating-point coprocessor lazily, per
 // task, on context switch - not on arbitrary interrupt entry/exit. Using
@@ -96,7 +109,7 @@ static void IRAM_ATTR cp_sense_isr(void *arg) {
     // flash-resident driver code - see the "fourth deviation" comment below.
     int level = gpio_ll_get_level(&GPIO, (gpio_num_t)CP_PWM_SENSE_GPIO);
 
-    if (level == 1) {
+    if (level == 0) { // real rising edge - see polarity note above
         if (s_lastRiseUs > 0) {
             int64_t period = nowUs - s_lastRiseUs;
             // NATIVE_PERIOD_MIN_US/MAX_US are compile-time double literals;
@@ -115,7 +128,7 @@ static void IRAM_ATTR cp_sense_isr(void *arg) {
             schedule_clamp_ticks(s_assertOffsetTicks, s_holdTicksRmt);
             s_clampedThisCycle = true;
         }
-    } else {
+    } else { // real falling edge - see polarity note above
         if (!s_clampedThisCycle && s_lastRiseUs > 0) {
             int64_t high = nowUs - s_lastRiseUs;
             if (high > 0 && high < (int64_t)s_nativePeriodUs) {
@@ -216,9 +229,11 @@ static void cp_hw_init() {
 // CONNECTED_IN's comparator (U2B) sees SENSE above REF_CONN, i.e. state A
 // (~12V, no vehicle); HIGH for every connected level (B/C/D/E/F all sit
 // below REF_CONN) - inverted from the originally-assumed polarity, per the
-// comparator/opto stage actually installed. CP_PWM_SENSE_GPIO's existing
-// level convention (HIGH during the driven-high portion of a cycle) is
-// reused unchanged for the EDGE_IN reads below.
+// comparator/opto stage actually installed. CP_PWM_SENSE_GPIO is the same
+// story (see cp_sense_isr()'s polarity note): raw GPIO reads LOW while the
+// real CP line is high, HIGH while it's low - inverted from the originally-
+// assumed "HIGH during the driven-high portion" convention, so the
+// idle-level check below is inverted to match.
 static ConnectorState read_connector_state() {
     bool notConnected = gpio_get_level((gpio_num_t)CP_CONNECTED_SENSE_GPIO) == 0;
     if (notConnected) return CONN_STATE_A;
@@ -236,7 +251,7 @@ static ConnectorState read_connector_state() {
     // threshold can't tell these apart (both read "connected"), but
     // EDGE_IN's idle *level* can, since B's ~9V sits above REF_EDGE while
     // E/F's ~0V sits below it.
-    bool edgeIdleHigh = gpio_get_level((gpio_num_t)CP_PWM_SENSE_GPIO) == 1;
+    bool edgeIdleHigh = gpio_get_level((gpio_num_t)CP_PWM_SENSE_GPIO) == 0;
     return edgeIdleHigh ? CONN_STATE_B : CONN_STATE_FAULT;
 }
 
@@ -407,9 +422,21 @@ void cp_interceptor_task(void *pvParameters) {
             double effectiveDutyPct = min((double)targetDutyPct, nativeDutyPct);
 
             if (nativeDutyPct - effectiveDutyPct >= MIN_CLAMP_MARGIN_PCT) {
-                double assertOffsetUs = (double)nativePeriodUs * effectiveDutyPct / 100.0 - CLAMP_DISPATCH_LATENCY_US;
+                // assertTargetUs is the real-world instant we want the clamp
+                // to visibly assert at; assertOffsetUs pulls the *armed*
+                // timer earlier by CLAMP_DISPATCH_LATENCY_US so dispatch
+                // delay lands the actual assert back on assertTargetUs. Hold
+                // duration must be measured from that same real-world
+                // target, not from the already-pulled-earlier assertOffsetUs
+                // - the RMT hold is a pure hardware countdown starting at
+                // the (compensated) actual assert instant, so re-subtracting
+                // the latency here would make the release land
+                // CLAMP_DISPATCH_LATENCY_US late, past the native falling
+                // edge and into the negative half-cycle.
+                double assertTargetUs = (double)nativePeriodUs * effectiveDutyPct / 100.0;
+                double assertOffsetUs = assertTargetUs - CLAMP_DISPATCH_LATENCY_US;
                 if (assertOffsetUs < 0) assertOffsetUs = 0;
-                double holdUs = (double)nativeHighUs - assertOffsetUs;
+                double holdUs = (double)nativeHighUs - assertTargetUs;
                 if (holdUs < 0) holdUs = 0;
 
                 uint32_t ht = (uint32_t)(holdUs * 10.0); // RMT: 0.1us/tick
