@@ -151,13 +151,13 @@ static void handle_root() {
     }
 
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
-        ? "Bypass - clamp physically disconnected, charger running at its native rate"
+        ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
         : "Active - following the solar target below";
     const char *cpDutyStr = (cp.mode != MODE_ACTIVE)
         ? "-"
         : (cp.duty_state == CP_OSCILLATING)
             ? "Oscillating - clamping every cycle to the target duty"
-            : "Standby - surplus below the 6A floor, clamp released to native pass-through";
+            : "Disconnected - surplus below the 6A floor, CP relay open, not charging";
 
     snprintf(s_page_body, sizeof(s_page_body),
         "<!DOCTYPE html><html><head><title>geely-charger-controller</title>"

@@ -61,7 +61,7 @@ void status_display_task(void *pvParameters) {
 
         lcd.setCursor(0, 2);
         const char *cpStateStr = (cp.mode == MODE_BYPASS) ? "BYPASS"
-                                  : (cp.duty_state == CP_OSCILLATING) ? "OSC" : "STANDBY";
+                                  : (cp.duty_state == CP_OSCILLATING) ? "OSC" : "DISCON";
         snprintf(line, sizeof(line), "CP:%s Conn:%s", cpStateStr, connector_state_str(cp.connector_state));
         pad20(line);
         lcd.print(line);
