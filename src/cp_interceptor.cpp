@@ -219,6 +219,20 @@ static void cp_hw_init() {
     connectedConf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     connectedConf.intr_type = GPIO_INTR_DISABLE; // polled from the task, not interrupt-driven
     gpio_config(&connectedConf);
+
+    // Disconnect relay drive - plain digital output, task-context only (no
+    // ISR involvement, unlike CLAMP_DRIVE - the relay has no sub-cycle
+    // timing requirement). Explicitly driven low before anything else can
+    // run, matching the de-energized/closed/pass-through default described
+    // in config.h.
+    gpio_config_t relayConf = {};
+    relayConf.pin_bit_mask = (1ULL << CP_DISCONNECT_RELAY_GPIO);
+    relayConf.mode = GPIO_MODE_OUTPUT;
+    relayConf.pull_up_en = GPIO_PULLUP_DISABLE;
+    relayConf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    relayConf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&relayConf);
+    gpio_set_level((gpio_num_t)CP_DISCONNECT_RELAY_GPIO, 0);
 }
 
 // Task-context only (called at CP_STATUS_PUBLISH_MS cadence, not from an
@@ -339,6 +353,7 @@ void cp_interceptor_task(void *pvParameters) {
     bool bootstrapped = false;
     bool stale = true;
     float targetAmps = 0.0f;
+    uint32_t lastDutyStateChangeMs = 0; // dwell-time bookkeeping for the disconnect relay, see RELAY_MIN_DWELL_MS
 
     int64_t lastStaleCheckUs = 0;
     int64_t lastStatusPublishUs = 0;
@@ -399,17 +414,53 @@ void cp_interceptor_task(void *pvParameters) {
         // entry instead - targetAmps had to clear MIN_CURRENT_A+HYSTERESIS_A
         // before ever leaving STANDBY, so settling exactly at the 6.0A
         // floor produced no clamp signal at all; only settling at 8.0A did.)
-        CpDutyState newDutyState;
+        //
+        // CP_STANDBY while MODE_ACTIVE now drives the disconnect relay open
+        // (see relayShouldOpen below) rather than releasing the clamp to
+        // native pass-through - releasing to native was the bug this
+        // replaced: it handed the vehicle full uncapped current at exactly
+        // the moment surplus was lowest. Opening the relay on top of the
+        // existing amps hysteresis is gated by its own dwell timer
+        // (RELAY_MIN_DWELL_MS) below, since a real disconnect forces a fresh
+        // unplug/replug handshake and shouldn't retrigger faster than that
+        // can complete.
+        CpDutyState prevDutyState = dutyState;
+        uint32_t nowMs = (uint32_t)(now / 1000);
         if (mode == MODE_ACTIVE) {
-            if (dutyState == CP_OSCILLATING) {
-                newDutyState = (targetAmps < MIN_CURRENT_A - HYSTERESIS_A) ? CP_STANDBY : CP_OSCILLATING;
-            } else {
-                newDutyState = (targetAmps >= MIN_CURRENT_A) ? CP_OSCILLATING : CP_STANDBY;
+            CpDutyState candidateDutyState =
+                (dutyState == CP_OSCILLATING)
+                    ? ((targetAmps < MIN_CURRENT_A - HYSTERESIS_A) ? CP_STANDBY : CP_OSCILLATING)
+                    : ((targetAmps >= MIN_CURRENT_A) ? CP_OSCILLATING : CP_STANDBY);
+            if (candidateDutyState != dutyState && (nowMs - lastDutyStateChangeMs) >= RELAY_MIN_DWELL_MS) {
+                dutyState = candidateDutyState;
+                lastDutyStateChangeMs = nowMs;
             }
         } else {
-            newDutyState = CP_STANDBY;
+            // A fault must engage immediately, never wait out the relay
+            // dwell timer - but this doesn't actually move the relay either
+            // way, since relayShouldOpen below is unconditionally false
+            // whenever mode != MODE_ACTIVE.
+            dutyState = CP_STANDBY;
         }
-        dutyState = newDutyState;
+
+        // Only a fresh, confident MODE_ACTIVE "surplus is genuinely below
+        // the floor" decision opens the relay - MODE_BYPASS (stale data, or
+        // any other fault) always keeps it closed, favoring continued
+        // native-rate charging over guessing during a data fault, same
+        // tradeoff already accepted for the clamp itself.
+        bool relayShouldOpen = (mode == MODE_ACTIVE && dutyState == CP_STANDBY);
+        gpio_set_level((gpio_num_t)CP_DISCONNECT_RELAY_GPIO, relayShouldOpen ? 1 : 0);
+
+        // Native duty was learned against the pre-disconnect waveform; once
+        // the relay reopens (below) the Jueclat will renegotiate from
+        // scratch with the vehicle, quite possibly at a different native
+        // duty. Force a fresh learn after reconnect rather than clamping
+        // against stale pre-disconnect timing - reuses the existing
+        // "clamping skipped until native duty has been learned at least
+        // once" gate a few lines down, no new gating logic needed.
+        if (prevDutyState == CP_OSCILLATING && dutyState == CP_STANDBY) {
+            s_nativeHighKnown = false;
+        }
 
         bool clampEnabled = false;
         uint32_t assertOffsetTicks = 0;
