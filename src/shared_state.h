@@ -8,8 +8,14 @@ enum SystemMode {
 };
 
 enum CpDutyState {
-    CP_STANDBY = 0,     // clamp fully released, no PWM touched
-    CP_OSCILLATING = 1, // clamp active per current surplus
+    // While MODE_ACTIVE: surplus is genuinely below the 6A floor (with
+    // hysteresis) - the CP disconnect relay is driven open, isolating the
+    // vehicle's CP termination so the Jueclat reads "unplugged" and stops
+    // charging on its own. While MODE_BYPASS: just internal bookkeeping: the
+    // relay stays closed regardless (see cp_interceptor_task()) - a fault
+    // must never trigger a disconnect.
+    CP_STANDBY = 0,
+    CP_OSCILLATING = 1, // relay closed, clamp active per current surplus
 };
 
 enum ConnectorState {

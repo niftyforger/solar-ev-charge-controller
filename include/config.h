@@ -26,6 +26,19 @@
 // physical tap already planned for it.
 #define CP_CONNECTED_SENSE_GPIO 4
 
+// CP disconnect relay drive -> optocoupler -> relay coil driver transistor.
+// Drives a normally-closed (NC) relay in series on CP_LINE, downstream of
+// the sense/clamp tap, between the tap and the vehicle connector - see
+// CLAUDE.md "CP interception circuit". Energized (this GPIO driven high)
+// opens the relay, isolating the vehicle's CP termination so the Jueclat
+// reads the line as unplugged (state A) and stops charging on its own.
+// De-energized (GPIO low, including all power-loss/not-yet-initialized
+// cases) is the NC/default/closed state - native pass-through - matching
+// the same fail-safe direction as CLAMP_DRIVE/R10. GPIO7 was the original
+// (since-abandoned) RELAY_K1_GPIO placeholder from early in the project;
+// reused here for an unrelated purpose - see CLAUDE.md's K1 history note.
+#define CP_DISCONNECT_RELAY_GPIO 7
+
 // Status LCD I2C bus (matches the bring-up example in examples/display/display.ino)
 #define I2C_SDA_PIN             8
 #define I2C_SCL_PIN             9
@@ -91,6 +104,17 @@
 // caught bench-side 2026-08-24; see cp_interceptor.cpp.) Placeholder value
 // - tune empirically.
 #define HYSTERESIS_A             1.0f
+
+// Minimum time the CP_STANDBY/CP_OSCILLATING duty state (and therefore the
+// disconnect relay's position - see CP_DISCONNECT_RELAY_GPIO) must be held
+// before it's allowed to flip again, on top of the amps hysteresis above.
+// Two reasons this exists, independent of noise-driven flapping already
+// handled by HYSTERESIS_A: a mechanical relay has finite cycle life, and
+// every relay-open/relay-close cycle forces the Jueclat and vehicle through
+// a fresh unplug/replug handshake, which takes real time and shouldn't be
+// re-triggered faster than it can complete. Placeholder value - tune once
+// real handshake timing is observed on the bench.
+#define RELAY_MIN_DWELL_MS       10000UL
 
 // ---------------------------------------------------------------------------
 // Connector-state discrimination
