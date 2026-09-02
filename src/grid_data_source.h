@@ -16,11 +16,8 @@ struct GridDataSource {
     GridDataSourceReadFn read_power_w;
 };
 
-// The Sungrow SH8.0RS's WiNet-S Modbus TCP gateway is the true source of
-// this figure. The DTSU666-20 meter behind it is wired via RS485 directly
-// to the inverter and isn't polled directly (RTU only supports one bus
-// master, and the inverter already is one) - see grid_source_sungrow_winet.cpp
-// and CLAUDE.md "Solar data source".
+// See grid_source_sungrow_winet.cpp for the sourcing rationale (why the
+// WiNet-S, not the DTSU666-20 meter, is polled directly).
 extern const GridDataSource GRID_SOURCE_SUNGROW_WINET;
 
 // Compile-time selection - point this at a different GridDataSource if the

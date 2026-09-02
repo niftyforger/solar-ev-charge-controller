@@ -32,10 +32,9 @@ TEMPLATE = """#pragma once
 // do not edit by hand, edit .env instead (copy from .env.example). Both
 // files are gitignored either way.
 
-// Used ONLY for OTA flashing (ArduinoOTA). WiFi SSID/password, the inverter
-// IP, the BLE-config password, and the sim-mode control page's password are
-// provisioned entirely over BLE at runtime - see CLAUDE.md "BLE
-// configuration".
+// Used ONLY for OTA flashing (ArduinoOTA) - see CLAUDE.md "BLE
+// configuration" for how everything else (WiFi, inverter IP, BLE/web
+// passwords) is provisioned instead.
 #define OTA_PASSWORD        "{password}"
 """
 

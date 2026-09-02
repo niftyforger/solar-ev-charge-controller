@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """One-time setup so the PlatformIO IDE's plain "Upload" button (VSCode
 toolbar, `ota` environment selected) works without going through
-tools/ota_upload.py or exporting anything by hand first.
-
-Background: [env:ota] in platformio.ini doesn't declare upload_port/
-upload_flags at all - it relies entirely on PlatformIO's own built-in
-PLATFORMIO_UPLOAD_PORT/PLATFORMIO_UPLOAD_FLAGS environment variables (see
-https://docs.platformio.org/en/latest/envvars.html), which every pio
-invocation checks automatically, IDE button included. Those need to already
-exist in the OS environment before VSCode itself launches - a build-time
-mechanism (extra_scripts, or anything that only runs inside `pio run`'s own
-child build process) can't inject them in time, because by the time a
-pre-build script could set them, the parent `pio`/VSCode process asking for
-upload_port has already started with its own environment fixed. Persisting
-them as Windows user environment variables (via `setx`) sidesteps that:
-they're just... already there, for every future process, VSCode included.
+tools/ota_upload.py or exporting anything by hand first - persists
+PLATFORMIO_UPLOAD_PORT/PLATFORMIO_UPLOAD_FLAGS as Windows user environment
+variables (via `setx`) so they already exist before VSCode itself launches.
+See the [env:ota] comment in platformio.ini for why a build-time mechanism
+can't set these in time instead.
 
 Run this after every edit to .env's OTA_PASSWORD/UPLOAD_PORT, then RESTART
 VSCode - `setx` writes to the registry for FUTURE processes; it cannot

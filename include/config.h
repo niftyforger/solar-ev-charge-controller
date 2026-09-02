@@ -16,14 +16,11 @@
 // CP clamp drive output -> optocoupler -> MOSFET gate driver (RMT TX)
 #define CLAMP_DRIVE_GPIO       6
 
-// CP connector-state sense, CONNECTED_IN (post opto, digital 0/3.3V).
-// Per the CP interceptor schematic, this is no longer a raw analog read:
-// an LM393 dual comparator (U2) on the sense divider does the level
-// discrimination in hardware against two fixed references (REF_CONN
-// ~2.5V, REF_EDGE ~0.45V - see CLAUDE.md "CP interception circuit"),
-// and this GPIO just reads U2B's (CONNECTED_IN) digital output. No
-// longer needs to be ADC1-capable, but GPIO4 is kept to match the
-// physical tap already planned for it.
+// CP connector-state sense, CONNECTED_IN (post opto, digital 0/3.3V). Level
+// discrimination happens in hardware (LM393 dual comparator U2 against
+// REF_CONN ~2.5V/REF_EDGE ~0.45V - see CLAUDE.md "CP interception circuit");
+// this GPIO just reads U2B's digital output, so it doesn't need to be
+// ADC1-capable.
 #define CP_CONNECTED_SENSE_GPIO 4
 
 // CP disconnect relay drive -> optocoupler -> relay coil driver transistor.
@@ -34,9 +31,7 @@
 // reads the line as unplugged (state A) and stops charging on its own.
 // De-energized (GPIO low, including all power-loss/not-yet-initialized
 // cases) is the NC/default/closed state - native pass-through - matching
-// the same fail-safe direction as CLAMP_DRIVE/R3. GPIO7 was the original
-// (since-abandoned) RELAY_K1_GPIO placeholder from early in the project;
-// reused here for an unrelated purpose - see CLAUDE.md's K1 history note.
+// the same fail-safe direction as CLAMP_DRIVE/R3.
 #define CP_DISCONNECT_RELAY_GPIO 7
 
 // ---------------------------------------------------------------------------
@@ -65,24 +60,12 @@
 // interrupt context, no FreeRTOS task dispatch - see cp_interceptor.cpp) ->
 // raw RMT register write (rmt_ll_write_memory()/rmt_ll_tx_start()).
 //
-// History: 35.7us (calibrated against the superseded esp_timer/
-// ESP_TIMER_TASK mechanism, never re-verified after that path was replaced)
-// -> 10.7us (2026-08-24, first bench sample against the hardware-timer-
-// group-ISR path: target 10.0% duty, ~1kHz native period, typical measured
-// GPIO5-to-GPIO6 delta 75us against a 100us target, so old constant
-// (35.7) was over-subtracting by 25us: 35.7 - 25 = 10.7).
-//
-// Recalibrated again 2026-08-24, same day, after the ISRs were rewritten to
-// raw register access (hal/gpio_ll.h, hal/rmt_ll.h, hal/timer_ll.h) and
-// ESP_INTR_FLAG_IRAM (see cp_hw_init()/assert_timer_isr() in
-// cp_interceptor.cpp) - that rewrite removed the flash-resident driver call
-// overhead the 10.7us figure was measured against, so the mean shifted:
-// same 10.0% duty point now measured 95us against the still-100us target,
-// 5us short. Corrected value = 10.7 - 5 = 5.7us.
-//
-// Still only single bench samples at one duty point each time - re-derive
-// with more samples/duty points and a scope once real hardware (not the
-// bench simulator) is available.
+// Current value (5.7us) is a single bench sample at one duty point (10%),
+// taken against the current raw-register/ESP_INTR_FLAG_IRAM ISR path (see
+// cp_hw_init()/assert_timer_isr() in cp_interceptor.cpp) - re-derive with
+// more samples/duty points and a scope once real hardware (not the bench
+// simulator) is available. Any ISR-path rewrite invalidates this figure and
+// requires recalibration, since it's measuring that path's own overhead.
 #define CLAMP_DISPATCH_LATENCY_US   5.7
 
 // Hysteresis band for *dropping back* to STANDBY once already OSCILLATING:
@@ -90,11 +73,10 @@
 // MIN_CURRENT_A, so noise sitting right at the floor can't flap the clamp
 // on/off every planning pass. Entering OSCILLATING from STANDBY uses the
 // bare MIN_CURRENT_A floor with no margin - 10% duty is itself a fully
-// valid signal, not a marginal one, so there's no reason to withhold it.
-// (An earlier version put the margin on entry instead, which meant
-// settling exactly at the 6.0A floor produced no clamp signal at all -
-// caught bench-side 2026-08-24; see cp_interceptor.cpp.) Placeholder value
-// - tune empirically.
+// valid signal, not a marginal one. The margin must stay on the exit side
+// only, not entry too (see cp_interceptor.cpp) - putting it on entry means
+// settling exactly at the floor never leaves STANDBY. Placeholder value -
+// tune empirically.
 #define HYSTERESIS_A             1.0f
 
 // Minimum time the CP_STANDBY/CP_OSCILLATING duty state (and therefore the
@@ -111,25 +93,19 @@
 // ---------------------------------------------------------------------------
 // Connector-state discrimination
 //
-// Level discrimination now happens in hardware (U2, LM393 dual comparator -
-// see CP_CONNECTED_SENSE_GPIO above and CLAUDE.md "CP interception
-// circuit"), not via ADC breakpoints in firmware. What's left in software
-// is combining CONNECTED_IN's level with EDGE_IN's (CP_PWM_SENSE_GPIO)
+// Level discrimination happens in hardware (U2, LM393 dual comparator - see
+// CP_CONNECTED_SENSE_GPIO above and CLAUDE.md "CP interception circuit").
+// Software just combines CONNECTED_IN's level with EDGE_IN's (CP_PWM_SENSE_GPIO)
 // recent activity/level - see read_connector_state() in cp_interceptor.cpp.
-//
-// With a single CONNECTED_IN threshold (REF_CONN ~2.5V, sitting between
-// state A's ~12V and state B's ~9V) and a single EDGE_IN threshold
-// (REF_EDGE ~0.45V, sitting between state D's ~3V and state E's 0V), the
-// achievable resolution is four buckets, not the full six CP levels:
-//   A          - CONNECTED_IN reads "not connected"
-//   B          - connected, EDGE_IN steady-high, no recent toggling
-//   C (incl. D)- connected, EDGE_IN toggling recently (oscillating)
-//   FAULT (incl. E/F) - connected, EDGE_IN steady-low, no recent toggling
-// C/D and E/F are each conflated - the peak-amplitude difference between
-// them is exactly what a digital comparator discards. Accepted tradeoff:
-// D (ventilated charging) is unused by this vehicle/install, and E/F both
-// already map to "don't clamp" behaviourally, so the conflation doesn't
-// affect control-loop safety, only status granularity.
+// One CONNECTED_IN threshold (REF_CONN, between state A and B) and one
+// EDGE_IN threshold (REF_EDGE, between state D and E) give four resolvable
+// buckets, not the full six CP levels: A (not connected); B (connected,
+// EDGE_IN steady-high); C incl. D (connected, EDGE_IN toggling recently);
+// FAULT incl. E/F (connected, EDGE_IN steady-low). C/D and E/F are each
+// conflated - the amplitude difference a digital comparator discards.
+// Accepted: D (ventilated charging) is unused on this install, and E/F both
+// already map to "don't clamp", so the conflation costs status granularity
+// only, not control-loop safety.
 //
 // CP_ACTIVITY_TIMEOUT_US is how long since the last rising edge before
 // read_connector_state() stops considering the line "currently
@@ -157,21 +133,14 @@
 #define CP_TASK_WDT_TIMEOUT_MS    3000
 
 // Independent recovery watchdog for solar_control_task (Core 0), checked by
-// Core 1 alongside its own CP_STALE_CHECK_MS cadence - see
-// shared_state_heartbeat_solar_task()/shared_state_solar_task_heartbeat_age_ms()
-// and the check in cp_interceptor_task(). Deliberately NOT the same
-// esp_task_wdt_add() mechanism as CP_TASK_WDT_TIMEOUT_MS above: that's a
-// single global ESP-IDF TWDT period shared by every registered task, and
-// solar_control_task legitimately blocks far longer than 3s during an
-// ArduinoOTA push (Core 0 blocks on flash writes for the whole transfer -
-// see "OTA & simulation mode" in CLAUDE.md, which already treats pushes
-// approaching STALE_DATA_TIMEOUT_MS/60s as unremarkable). Registering this
-// task on the CP task's tight watchdog would abort every real OTA update;
-// this separate, longer, Core-1-driven check exists so a genuinely wedged
-// Core 0 (WiFi/lwIP/WebServer hang - the known failure mode this addresses)
-// still self-recovers via esp_restart(), without weakening the CP task's
-// own watchdog protection at all. Sized comfortably above any expected OTA
-// duration for this firmware's image size on local WiFi.
+// Core 1 - see shared_state_heartbeat_solar_task() in shared_state.h and the
+// check in cp_interceptor_task(). Deliberately separate from
+// CP_TASK_WDT_TIMEOUT_MS's esp_task_wdt_add() mechanism: solar_control_task
+// legitimately blocks far longer than 3s during an ArduinoOTA push (Core 0
+// blocks on flash writes for the whole transfer), so registering it on the
+// CP task's tight watchdog would abort every real OTA update. Sized
+// comfortably above any expected OTA duration for this firmware's image
+// size on local WiFi.
 #define SOLAR_TASK_HEARTBEAT_TIMEOUT_MS 120000UL
 
 // ---------------------------------------------------------------------------
