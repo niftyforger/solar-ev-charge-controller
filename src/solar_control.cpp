@@ -286,17 +286,13 @@ static void register_network_services() {
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
 // whatever WiFi connection is current. Unlike register_network_services()
 // above, this IS meant to be called again after every WiFi drop/reconnect -
-// see the call site. ArduinoOTA.begin() is a no-op if it thinks it's
-// already initialized (guarded by an internal _initialized flag - checked
-// directly in this version's ArduinoOTA.cpp), so without an explicit end()
-// first, its UDP socket stays bound to the old (torn-down) network
-// interface forever after a reconnect - the web UI/OTA becoming
-// permanently unreachable after any WiFi hiccup, until a full power cycle,
-// while Modbus (a fresh short-lived socket every poll) keeps working, was
-// traced to exactly this. WebServer::begin() already self-closes its
-// previous listener internally, so it doesn't strictly need the explicit
-// close() below, but it's included for symmetry/clarity and because
-// close() on a never-started server is a harmless no-op either way.
+// see the call site. ArduinoOTA.begin() is a no-op once it thinks it's
+// already initialized, so without an explicit end() first, its UDP socket
+// stays bound to the old (torn-down) interface forever after a reconnect -
+// OTA/the web UI going permanently unreachable until a power cycle, while
+// Modbus (a fresh socket every poll) keeps working. The explicit
+// s_web_server.close() isn't strictly needed (begin() self-closes), but is
+// harmless and kept for symmetry.
 static void start_network_services() {
     ArduinoOTA.end();
     s_web_server.close();
