@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <math.h>
 
 // What the control law just did, kept alongside the numeric target so the
@@ -95,6 +96,38 @@ static void connect_wifi(const RuntimeConfig &cfg) {
 static bool s_sim_mode_active = false;
 static float s_simulated_grid_power_w = SIM_DEFAULT_GRID_POWER_W;
 
+// --- Grid data source: runtime-selectable, separate from sim mode ---------
+// Same ownership as the sim-mode statics above: only Core 0's solar_control_
+// task ever reads or writes this (poll loop + its synchronous WebServer
+// handlers), so no mutex is needed. Always a valid pointer - either this
+// compile-time default or whatever grid_data_source_lookup() returns, which
+// itself never returns null (falls back to index 0) - so no call site needs
+// a null check.
+static const GridDataSource *s_active_grid_source = &GRID_SOURCE_SUNGROW_WINET;
+
+static const char *GRID_SOURCE_NVS_NAMESPACE = "gridsrc";
+
+// Independent of ble_config.cpp's "netcfg" namespace - this isn't a
+// BLE-provisioned setting, it's chosen from the HTTP control page.
+static void load_grid_source_from_nvs() {
+    Preferences prefs;
+    prefs.begin(GRID_SOURCE_NVS_NAMESPACE, true);
+    String id = prefs.getString("id", "");
+    prefs.end();
+    if (id.length() > 0) {
+        s_active_grid_source = &grid_data_source_lookup(id.c_str());
+    }
+    // else: nothing saved yet (first boot / fresh NVS) - keep the
+    // compile-time default, preserving today's real-hardware behavior.
+}
+
+static void save_grid_source_to_nvs(const char *id) {
+    Preferences prefs;
+    prefs.begin(GRID_SOURCE_NVS_NAMESPACE, false);
+    prefs.putString("id", id);
+    prefs.end();
+}
+
 // Latest status, cached here purely for the web UI so handle_root() can
 // render the same picture the control loop just acted on rather than
 // re-deriving it. Written once per poll from solar_control_task's own loop,
@@ -140,7 +173,7 @@ static const char *connector_state_str(ConnectorState s) {
 // (rather than a stack local) so a deeply nested call chain (WiFi/OTA/
 // WebServer internals all run inside this same task) never has to find a
 // couple of KB of extra stack for it.
-static char s_page_body[3072];
+static char s_page_body[4096];
 
 static void handle_root() {
     if (!require_auth()) {
@@ -175,7 +208,20 @@ static void handle_root() {
 
     const char *dataSourceStr = s_last_solar_status.simulated
         ? "Simulated"
-        : ACTIVE_GRID_DATA_SOURCE.name;
+        : s_active_grid_source->name;
+
+    char sourceOptions[384] = "";
+    {
+        size_t offset = 0;
+        for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < sizeof(sourceOptions); i++) {
+            const GridDataSource *src = GRID_SOURCE_REGISTRY[i];
+            offset += snprintf(sourceOptions + offset, sizeof(sourceOptions) - offset,
+                "<option value=\"%s\"%s>%s</option>",
+                src->id,
+                (src == s_active_grid_source) ? " selected" : "",
+                src->name);
+        }
+    }
 
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
         ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
@@ -206,6 +252,12 @@ static void handle_root() {
         "<p>WiFi: <span class=\"%s\">%s</span></p>"
         "<p>Data source: <b>%s</b>%s</p>"
         "<p>Last successful poll: <b>%s</b>%s</p>"
+
+        "<h2>Grid data source</h2>"
+        "<form action=\"/set_source\" method=\"get\">"
+        "<select name=\"id\">%s</select> "
+        "<input type=\"submit\" value=\"Apply\">"
+        "</form>"
 
         "<h2>Simulation mode</h2>"
         "<p>Mode: <b>%s</b></p>"
@@ -244,6 +296,8 @@ static void handle_root() {
         pollAgeStr,
         stale ? " <span class=\"warn\">- STALE, CP fail-safe will bypass to native pass-through</span>" : "",
 
+        sourceOptions,
+
         s_sim_mode_active ? "Simulated" : "Real",
         s_simulated_grid_power_w,
         s_sim_mode_active ? "" : "checked",
@@ -266,6 +320,21 @@ static void handle_set() {
     s_web_server.send(302, "text/plain", "");
 }
 
+static void handle_set_source() {
+    if (!require_auth()) {
+        return;
+    }
+    if (s_web_server.hasArg("id")) {
+        s_active_grid_source = &grid_data_source_lookup(s_web_server.arg("id").c_str());
+        // Persist the resolved id, not the raw request arg - an unrecognized
+        // id in the request self-heals to the default rather than saving a
+        // value that would need re-resolving (with a fallback) on next boot.
+        save_grid_source_to_nvs(s_active_grid_source->id);
+    }
+    s_web_server.sendHeader("Location", "/");
+    s_web_server.send(302, "text/plain", "");
+}
+
 // Route/callback registration: allocates handler objects (WebServer::on()
 // appends a new FunctionRequestHandler to an internal linked list every
 // call, never replacing an existing one), so this must run exactly once for
@@ -281,6 +350,7 @@ static void register_network_services() {
 
     s_web_server.on("/", HTTP_GET, handle_root);
     s_web_server.on("/set", HTTP_GET, handle_set);
+    s_web_server.on("/set_source", HTTP_GET, handle_set_source);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
@@ -306,6 +376,7 @@ void solar_control_task(void *pvParameters) {
 
     RuntimeConfig cfg = shared_state_get_runtime_config();
     uint32_t lastAppliedGeneration = cfg.generation;
+    load_grid_source_from_nvs();
 
     connect_wifi(cfg);
     register_network_services();
@@ -392,7 +463,7 @@ void solar_control_task(void *pvParameters) {
                 shared_state_set_target_amps(targetAmps);
             } else if (status.wifi_connected) {
                 float gridPowerW;
-                if (ACTIVE_GRID_DATA_SOURCE.read_power_w(inverterIp, gridPowerW)) {
+                if (s_active_grid_source->read_power_w(inverterIp, gridPowerW)) {
                     status.modbus_ok = true;
                     status.grid_power_w = gridPowerW;
                     lastPollSuccessMs = millis();
