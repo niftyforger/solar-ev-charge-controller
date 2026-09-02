@@ -364,7 +364,7 @@ select{width:100%}
     if (document.activeElement !== $('wattsInput')) {
       $('wattsInput').value = d.sim_w;
     }
-    $('wattsRow').style.display = d.sim_active ? 'flex' : 'none';
+    $('wattsRow').style.display = d.sim_active ? 'block' : 'none';
   }
 
   function showError(msg){
