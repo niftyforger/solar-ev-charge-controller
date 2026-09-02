@@ -34,7 +34,7 @@
 // reads the line as unplugged (state A) and stops charging on its own.
 // De-energized (GPIO low, including all power-loss/not-yet-initialized
 // cases) is the NC/default/closed state - native pass-through - matching
-// the same fail-safe direction as CLAMP_DRIVE/R10. GPIO7 was the original
+// the same fail-safe direction as CLAMP_DRIVE/R3. GPIO7 was the original
 // (since-abandoned) RELAY_K1_GPIO placeholder from early in the project;
 // reused here for an unrelated purpose - see CLAUDE.md's K1 history note.
 #define CP_DISCONNECT_RELAY_GPIO 7

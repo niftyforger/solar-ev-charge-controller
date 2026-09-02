@@ -59,28 +59,30 @@ See [Safety model](#safety-model) below for the full fail-safe contract.
 
 KiCad source: [`schematic/solar-ev-charge-controller/`](schematic/solar-ev-charge-controller/).
 
-`CP_LINE` feeds a high-Z divider (`R1`/`R2`) down to a `SENSE` node, read by a dual comparator (`U1`, LM393) against two fixed reference taps — one output detects vehicle-connected state (`CONNECTED_IN`), the other detects PWM edge activity (`EDGE_IN`). Each comparator output, plus the clamp drive command going the other way, crosses into the ESP32's domain through its own optocoupler (`U2`/`U3`/`U4`) — that's the only isolation boundary; the sense/comparator/clamp circuitry otherwise shares `GND`/`+5V` with the ESP32 side. The clamp itself is a MOSFET (`Q2`, AO3400) that taps onto `CP_LINE` through a series blocking diode (`D3`) and shunts it toward `GND` when driven; its gate defaults low via a pull-down resistor (`R10`) whenever nothing is actively driving it.
+`CP_LINE` feeds a high-Z divider (`R5`/`R6`) down to a `SENSE` node, read by a dual comparator (`U2`, LM393) against two fixed reference taps — one output detects vehicle-connected state (`CONNECTED_IN`), the other detects PWM edge activity (`EDGE_IN`). Each comparator output, plus the clamp drive command going the other way, crosses into the ESP32's domain through its own optocoupler (`U3`/`U4`/`U1` respectively) — that's the only isolation boundary; the sense/comparator/clamp circuitry otherwise shares `GND`/`+5V` with the ESP32 side. The clamp itself is a MOSFET (`Q2`, 2N7000) that taps onto `CP_LINE` through a series blocking diode (`D2`) and shunts it toward `GND` when driven; its gate defaults low via a pull-down resistor (`R3`) whenever nothing is actively driving it.
 
-Further downstream (toward the vehicle) of the `R1`/`D3` tap sits a normally-closed disconnect relay (`K1`), wired in series on `CP_LINE` itself rather than tapped off it — the one deliberate break in an otherwise continuous wire. Its coil is driven through its own optocoupler and a low-side driver transistor, with a flyback diode across the coil. De-energized (the default whenever nothing is actively driving it) the contact stays closed and `CP_LINE` passes straight through; energizing it opens the contact and isolates the vehicle's CP termination from everything upstream, which the EVSE reads as a real unplug.
+Further downstream (toward the vehicle) of the `R5`/`D2` tap sits a normally-closed disconnect relay (`K1`), wired in series on `CP_LINE` itself rather than tapped off it — the one deliberate break in an otherwise continuous wire. Its coil is driven through its own optocoupler and a low-side driver transistor (`Q1`), with a flyback diode (`D1`) across the coil. De-energized (the default whenever nothing is actively driving it) the contact stays closed and `CP_LINE` passes straight through; energizing it opens the contact and isolates the vehicle's CP termination from everything upstream, which the EVSE reads as a real unplug.
+
+**Reference designators were renumbered by a KiCad annotation pass; the table below reflects the current schematic, wire-traced pin-by-pin to confirm.**
 
 | Ref | Part | Note |
 |---|---|---|
-| `R1` / `R2` | 100kΩ / 33kΩ | `CP_LINE` → `SENSE` divider |
-| `D1` / `D2` | 1N4001 | `SENSE` overvoltage clamp to `+5V` / `GND` |
-| `R3` / `R4` / `R5` | 10k / 8.2k / 1.8k | reference ladder off `+5V` (REF_EDGE ≈0.45V, REF_CONN ≈2.5V) |
-| `U1` | LM393 | dual comparator — `U1A` → `EDGE_IN`, `U1B` → `CONNECTED_IN` |
-| `R6` / `R7` | 4.7kΩ | comparator output pull-up, doubles as opto LED current limit |
-| `U2` / `U3` | SFH617A-3 | `EDGE_IN` / `CONNECTED_IN` optocouplers |
-| `R8` / `R9` | 10kΩ | `EDGE_IN` / `CONNECTED_IN` pull-up to `+3.3V` (opto secondary) |
-| `R14` | 220Ω | `CLAMP_DRIVE` opto LED current limit |
-| `U4` | SFH617A-3 | `CLAMP_DRIVE` optocoupler |
-| `R13` | 220Ω | opto secondary → `Q2` gate series resistor |
-| `R10` | 10kΩ | `Q2` gate pull-down (default off) |
-| `Q2` | AO3400 | clamp MOSFET |
-| `D3` | 1N4148 | series blocking diode, `CP_LINE` → `Q2` drain |
-| `R12` | 220Ω | `Q2` source → `GND`, clamp current limit |
-| `K1` | 5V SPDT signal relay (NC contact used) | disconnect relay, in series on `CP_LINE` downstream of the `R1`/`D3` tap |
-| — | opto + driver transistor + flyback diode | `K1` coil drive, isolated the same way as `U2`/`U3`/`U4` |
+| `R5` / `R6` | 100kΩ / 33kΩ | `CP_LINE` → `SENSE` divider |
+| `D3` / `D4` | 1N4001 | `SENSE` overvoltage clamp to `+5V` / `GND` |
+| `R8` / `R9` / `R10` | 10k / 8.2k / 1.8k | reference ladder off `+5V` (REF_CONN ≈2.5V, REF_EDGE ≈0.45V) |
+| `U2` | LM393 | dual comparator — unit 1 → `CONNECTED_IN` chain, unit 2 → `EDGE_IN` chain |
+| `R11` / `R12` | 4.7kΩ | comparator unit 1/2 output pull-up to `+5V`, doubles as opto LED drive |
+| `U3` / `U4` | SFH617A-3 | `CONNECTED_IN` / `EDGE_IN` optocouplers |
+| `R13` / `R14` | 10kΩ | `CONNECTED_IN` / `EDGE_IN` pull-up to `+3.3V` (opto secondary) |
+| `R7` | 220Ω | `CLAMP_DRIVE` opto (`U1`) LED current limit |
+| `U1` | SFH617A-3 | `CLAMP_DRIVE` optocoupler |
+| `R4` | 220Ω | opto secondary → `Q2` gate series resistor |
+| `R3` | 10kΩ | `Q2` gate pull-down (default off) |
+| `Q2` | 2N7000 | clamp MOSFET |
+| `D2` | 1N4001 | series blocking diode, `CP_LINE` → `Q2` |
+| `K1` | 5V SPDT signal relay (NC contact used) | disconnect relay, in series on `CP_LINE` downstream of the `R5`/`D2` tap |
+| `Q1` | 2N7000 | `K1` coil low-side driver transistor |
+| `D1` | 1N4001 | `K1` coil flyback diode |
 
 Values are a starting point, not final — see [CLAUDE.md § CP interception circuit](CLAUDE.md#cp-interception-circuit) for the full rationale and [§ Open questions](CLAUDE.md#open-questions-for-implementation) for what's still unverified on the bench.
 
