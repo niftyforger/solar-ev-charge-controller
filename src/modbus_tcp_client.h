@@ -23,10 +23,3 @@ private:
     uint32_t _timeoutMs;
     uint16_t _transactionId;
 };
-
-// Convenience helper: reads REG_GRID_POWER (2 registers, S32, little-endian
-// word order, 1W/count) and returns it as signed watts, negative = exporting
-// (the raw register's own native polarity is the opposite - positive =
-// exporting - this function negates it so callers see negative = exporting
-// consistently; see CLAUDE.md).
-bool modbus_read_grid_power_w(IPAddress ip, float &outWatts);

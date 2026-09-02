@@ -30,7 +30,7 @@
 // Drives a normally-closed (NC) relay in series on CP_LINE, downstream of
 // the sense/clamp tap, between the tap and the vehicle connector - see
 // CLAUDE.md "CP interception circuit". Energized (this GPIO driven high)
-// opens the relay, isolating the vehicle's CP termination so the Jueclat
+// opens the relay, isolating the vehicle's CP termination so the EVSE
 // reads the line as unplugged (state A) and stops charging on its own.
 // De-energized (GPIO low, including all power-loss/not-yet-initialized
 // cases) is the NC/default/closed state - native pass-through - matching
@@ -38,14 +38,6 @@
 // (since-abandoned) RELAY_K1_GPIO placeholder from early in the project;
 // reused here for an unrelated purpose - see CLAUDE.md's K1 history note.
 #define CP_DISCONNECT_RELAY_GPIO 7
-
-// Status LCD I2C bus (matches the bring-up example in examples/display/display.ino)
-#define I2C_SDA_PIN             8
-#define I2C_SCL_PIN             9
-#define LCD_I2C_ADDR            0x27
-#define LCD_COLS                20
-#define LCD_ROWS                4
-#define LCD_REFRESH_MS          1000
 
 // ---------------------------------------------------------------------------
 // CP electrical / protocol constants (IEC 61851-1 / SAE J1772 §6.4)
@@ -110,7 +102,7 @@
 // before it's allowed to flip again, on top of the amps hysteresis above.
 // Two reasons this exists, independent of noise-driven flapping already
 // handled by HYSTERESIS_A: a mechanical relay has finite cycle life, and
-// every relay-open/relay-close cycle forces the Jueclat and vehicle through
+// every relay-open/relay-close cycle forces the EVSE and vehicle through
 // a fresh unplug/replug handshake, which takes real time and shouldn't be
 // re-triggered faster than it can complete. Placeholder value - tune once
 // real handshake timing is observed on the bench.
@@ -137,7 +129,7 @@
 // them is exactly what a digital comparator discards. Accepted tradeoff:
 // D (ventilated charging) is unused by this vehicle/install, and E/F both
 // already map to "don't clamp" behaviourally, so the conflation doesn't
-// affect control-loop safety, only LCD/status granularity.
+// affect control-loop safety, only status granularity.
 //
 // CP_ACTIVITY_TIMEOUT_US is how long since the last rising edge before
 // read_connector_state() stops considering the line "currently
@@ -190,7 +182,30 @@
 #define STEP_MAX_A_PER_POLL       2.0f
 #define SETTLE_MS                 15000UL
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
-#define WIFI_HOSTNAME              "geely-charger-controller"
+#define WIFI_HOSTNAME              "solar-ev-charger"
+
+// ---------------------------------------------------------------------------
+// BLE config server (WiFi SSID/password, inverter IP - see ble_config.cpp).
+// WiFi/inverter-IP are provisioned entirely over BLE and stored in NVS;
+// there is no compile-time fallback (see CLAUDE.md "BLE configuration").
+// ---------------------------------------------------------------------------
+#define BLE_DEVICE_NAME            "solar-ev-charger"
+
+// How long after each boot BLE advertises, once the device has already been
+// provisioned at least once (an unprovisioned device - no SSID yet stored in
+// NVS - advertises indefinitely regardless of this value, since BLE is the
+// only way in and a time limit there could brick a factory-fresh board out
+// of range of its one configuration path). Placeholder - tune once real
+// provisioning-workflow timing is observed on the bench.
+#define BLE_ADVERTISE_WINDOW_MS    300000UL
+
+// How often to nudge a connected-but-idle BLE client with a hint to send
+// HELP, until they've sent anything at all - see ble_config.cpp. Repeating
+// (rather than a single banner right on connect) also sidesteps a client
+// not yet having subscribed to notifications at the instant of connection -
+// an early nudge landing before that subscription is simply dropped, and a
+// later one gets through.
+#define BLE_IDLE_HELP_INTERVAL_MS  5000UL
 
 // Solar simulation mode (night-time / no-sun bench testing): a WiFi control
 // page toggles between real Modbus readings and this synthetic value. See
@@ -199,15 +214,12 @@
 #define SIM_HTTP_PORT              80
 
 // ---------------------------------------------------------------------------
-// Sungrow SH8.0RS Modbus TCP (via WiNet-S dongle)
+// Grid data source
 // ---------------------------------------------------------------------------
-#define MODBUS_TCP_PORT           502
-#define MODBUS_UNIT_ID            1
-#define REG_GRID_POWER            13009   // S32, W, raw register is positive = exporting;
-                                            // modbus_read_grid_power_w() negates it so
-                                            // software-facing values are negative = exporting
-#define REG_GRID_POWER_COUNT      2
-#define MODBUS_TIMEOUT_MS         2000
+// Which meter/inverter link supplies the grid-power figure is modular - see
+// src/grid_data_source.h. Source-specific parameters (Modbus registers,
+// port, unit ID) live with their implementation (e.g. grid_source_dtsu666.cpp),
+// not here.
 
 // ---------------------------------------------------------------------------
 // FreeRTOS task priorities / core pinning
@@ -216,4 +228,4 @@
 #define CORE_CP                   1
 #define TASK_PRIO_CP              (configMAX_PRIORITIES - 1)
 #define TASK_PRIO_SOLAR           2
-#define TASK_PRIO_DISPLAY         1
+#define TASK_PRIO_BLE             1
