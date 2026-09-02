@@ -16,12 +16,13 @@ struct GridDataSource {
     GridDataSourceReadFn read_power_w;
 };
 
-// DTSU666-20 meter is the true source of this figure; it's read back over
-// the Sungrow SH8.0RS's WiNet-S Modbus TCP gateway rather than polled
-// directly (RTU only supports one bus master, and the inverter already is
-// one) - see grid_source_dtsu666.cpp and CLAUDE.md "Solar data source".
-extern const GridDataSource GRID_SOURCE_DTSU666;
+// The Sungrow SH8.0RS's WiNet-S Modbus TCP gateway is the true source of
+// this figure. The DTSU666-20 meter behind it is wired via RS485 directly
+// to the inverter and isn't polled directly (RTU only supports one bus
+// master, and the inverter already is one) - see grid_source_sungrow_winet.cpp
+// and CLAUDE.md "Solar data source".
+extern const GridDataSource GRID_SOURCE_SUNGROW_WINET;
 
 // Compile-time selection - point this at a different GridDataSource if the
 // installed meter/inverter ever changes.
-#define ACTIVE_GRID_DATA_SOURCE GRID_SOURCE_DTSU666
+#define ACTIVE_GRID_DATA_SOURCE GRID_SOURCE_SUNGROW_WINET

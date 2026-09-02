@@ -218,7 +218,7 @@
 // ---------------------------------------------------------------------------
 // Which meter/inverter link supplies the grid-power figure is modular - see
 // src/grid_data_source.h. Source-specific parameters (Modbus registers,
-// port, unit ID) live with their implementation (e.g. grid_source_dtsu666.cpp),
+// port, unit ID) live with their implementation (e.g. grid_source_sungrow_winet.cpp),
 // not here.
 
 // ---------------------------------------------------------------------------
