@@ -169,17 +169,274 @@ static const char *connector_state_str(ConnectorState s) {
     }
 }
 
-// Reused as the scratch buffer for the rendered page: kept file-scope
-// (rather than a stack local) so a deeply nested call chain (WiFi/OTA/
-// WebServer internals all run inside this same task) never has to find a
-// couple of KB of extra stack for it.
-static char s_page_body[4096];
+// Status-badge color class for each connector state - shared between the
+// JSON API (below) and nothing else server-side; the SPA's CSS defines what
+// each class actually looks like.
+static const char *connector_state_cls(ConnectorState s) {
+    switch (s) {
+        case CONN_STATE_A: return "muted";
+        case CONN_STATE_B: return "info";
+        case CONN_STATE_C: return "ok";
+        default:           return "bad";
+    }
+}
+
+// Short badge labels - connector_state_str()/the cp mode/duty sentences
+// above are full explanations, too long to sit inside a pill-shaped badge
+// without wrapping (confirmed visually), so the SPA shows these short forms
+// in the badge itself and the full sentence as a hover tooltip instead.
+static const char *connector_state_label(ConnectorState s) {
+    switch (s) {
+        case CONN_STATE_A: return "A - Idle";
+        case CONN_STATE_B: return "B - Connected";
+        case CONN_STATE_C: return "C - Charging";
+        default:           return "Fault / Disconnected";
+    }
+}
+
+// --- Static SPA shell -------------------------------------------------
+// Contains no per-request data - every dynamic value is fetched by the
+// page's own JS from /api/status after load, so this can be a plain
+// compile-time PROGMEM constant instead of an snprintf'd buffer. Self-
+// contained (no external CSS/JS/fonts): this device has no internet path
+// worth relying on for a LAN control page.
+static const char PAGE_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>solar-ev-charger</title>
+<style>
+:root{
+  --bg:#f3f4f6;--bg-elev:#ffffff;--border:#e3e5ea;--text:#1a1d23;--text-muted:#6b7280;
+  --accent:#2563eb;--ok:#15803d;--ok-bg:#dcfce7;--warn:#b45309;--warn-bg:#fef3c7;
+  --bad:#b91c1c;--bad-bg:#fee2e2;--info:#1d4ed8;--info-bg:#dbeafe;
+  --muted:#4b5563;--muted-bg:#e5e7eb;--radius:14px;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 6px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e1116;--bg-elev:#171b22;--border:#2a2f3a;--text:#e6e9ef;--text-muted:#9aa3b2;
+    --accent:#5b8def;--ok:#34d399;--ok-bg:rgba(52,211,153,.15);--warn:#fbbf24;--warn-bg:rgba(251,191,36,.15);
+    --bad:#f87171;--bad-bg:rgba(248,113,113,.15);--info:#7ea6f7;--info-bg:rgba(126,166,247,.15);
+    --muted:#9aa3b2;--muted-bg:rgba(154,163,178,.15);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 1px 10px rgba(0,0,0,.4);
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:900px;margin:0 auto;padding:24px 20px 60px}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px}
+.topbar h1{font-size:1.3rem;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.card{background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 14px;font-size:.72rem;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--text-muted)}
+.card-settings{border-style:dashed}
+.stat-value{font-size:2.6rem;font-weight:700;line-height:1.1;letter-spacing:-.02em}
+.stat-value-sub{font-size:1.1rem;font-weight:500;color:var(--text-muted)}
+.stat-sub{color:var(--text-muted);margin-top:4px;font-size:.9rem}
+.flow-row{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:.95rem}
+.flow-dot{width:10px;height:10px;border-radius:50%;flex:none}
+.flow-export{background:var(--ok)}
+.flow-import{background:var(--warn)}
+.kv{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;
+  border-top:1px solid var(--border)}
+.kv:first-of-type{border-top:none;padding-top:0}
+.kv>span:first-child{color:var(--text-muted)}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.78rem;font-weight:600}
+.badge-ok{background:var(--ok-bg);color:var(--ok)}
+.badge-warn{background:var(--warn-bg);color:var(--warn)}
+.badge-bad{background:var(--bad-bg);color:var(--bad)}
+.badge-info{background:var(--info-bg);color:var(--info)}
+.badge-muted{background:var(--muted-bg);color:var(--muted)}
+.banner{border-radius:10px;padding:12px 16px;font-size:.9rem;margin-bottom:16px}
+.banner-warn{background:var(--warn-bg);color:var(--warn)}
+.banner-bad{background:var(--bad-bg);color:var(--bad)}
+select,input[type=number],button{
+  font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);
+  border-radius:8px;padding:6px 10px}
+button{background:var(--accent);color:#fff;border-color:var(--accent);cursor:pointer;font-weight:600}
+button:hover{filter:brightness(1.08)}
+select{width:100%}
+.field{padding:10px 0;border-top:1px solid var(--border)}
+.field:first-of-type{border-top:none;padding-top:0}
+.field label{display:block;color:var(--text-muted);margin-bottom:6px}
+.watts-input-group{display:flex;gap:8px}
+.watts-input-group input[type=number]{flex:1;min-width:0}
+.switch{position:relative;display:inline-block;width:42px;height:24px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--muted-bg);border-radius:999px;
+  transition:background .15s;cursor:pointer}
+.slider::before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;
+  background:var(--bg-elev);border-radius:50%;transition:transform .15s;box-shadow:var(--shadow)}
+.switch input:checked+.slider{background:var(--accent)}
+.switch input:checked+.slider::before{transform:translateX(18px)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Solar EV Charger Controller</h1>
+    <span id="wifiPill"></span>
+  </div>
+
+  <div id="errorBanner" class="banner banner-bad" style="display:none"></div>
+
+  <div id="dashboard" style="display:none">
+    <div class="grid">
+      <section class="card">
+        <h2>Target current</h2>
+        <div class="stat-value"><span id="targetAmps">-- A</span> <span class="stat-value-sub" id="targetWatts">(-- W)</span></div>
+        <div class="stat-sub" id="decision">Loading&hellip;</div>
+        <div class="flow-row"><span class="flow-dot" id="gridFlow"></span><span id="gridWatts">-- W</span></div>
+      </section>
+
+      <section class="card">
+        <h2>Charge point</h2>
+        <div class="kv"><span>Mode</span><span id="cpMode">--</span></div>
+        <div class="kv"><span>Clamp</span><span id="cpDuty">--</span></div>
+        <div class="kv"><span>Connector</span><span id="connector">--</span></div>
+      </section>
+
+      <section class="card">
+        <h2>Link health</h2>
+        <div class="kv"><span>Data source</span><span id="sourceName">--</span></div>
+        <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
+        <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
+          Data is stale &mdash; CP will fail safe to native pass-through.
+        </div>
+      </section>
+
+      <section class="card card-settings">
+        <h2>Settings</h2>
+        <div class="field">
+          <label for="sourceSelect">Grid source</label>
+          <select id="sourceSelect"></select>
+        </div>
+        <div class="kv">
+          <span>Simulation mode</span>
+          <label class="switch"><input type="checkbox" id="simToggle"><span class="slider"></span></label>
+        </div>
+        <div class="field" id="wattsRow" style="display:none">
+          <label for="wattsInput">Simulated watts</label>
+          <span class="watts-input-group">
+            <input type="number" id="wattsInput" step="50">
+            <button id="wattsApply" type="button">Apply</button>
+          </span>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  function $(id){ return document.getElementById(id); }
+  function badge(cls, text, title){
+    return '<span class="badge badge-' + cls + '"' + (title ? ' title="' + title + '"' : '') + '>' + text + '</span>';
+  }
+
+  function render(d){
+    $('targetAmps').textContent = d.target_a.toFixed(1) + ' A';
+    $('targetWatts').textContent = '(' + Math.round(d.target_w) + ' W)';
+    $('decision').textContent = d.decision + (d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
+    $('gridWatts').textContent = Math.abs(d.grid_w).toFixed(0) + ' W ' + (d.exporting ? 'exporting' : 'importing');
+    $('gridFlow').className = 'flow-dot ' + (d.exporting ? 'flow-export' : 'flow-import');
+
+    $('cpMode').innerHTML = badge(d.cp_mode_cls, d.cp_mode, d.cp_mode_title);
+    $('cpDuty').innerHTML = badge(d.duty_cls, d.cp_duty, d.cp_duty_title);
+    $('connector').innerHTML = badge(d.connector_cls, d.connector, d.connector_title);
+
+    $('wifiPill').innerHTML = badge(d.wifi ? 'ok' : 'bad', d.wifi ? 'Wi-Fi connected' : 'Wi-Fi disconnected');
+    $('sourceName').textContent = d.source + (d.poll_failed ? ' (last poll failed)' : '');
+    $('pollAge').textContent = d.poll_age;
+    $('staleWarn').style.display = d.stale ? 'block' : 'none';
+
+    if (document.activeElement !== $('sourceSelect')) {
+      $('sourceSelect').innerHTML = d.sources.map(function(s){
+        return '<option value="' + s.id + '"' + (s.active ? ' selected' : '') + '>' + s.name + '</option>';
+      }).join('');
+    }
+
+    $('simToggle').checked = d.sim_active;
+    if (document.activeElement !== $('wattsInput')) {
+      $('wattsInput').value = d.sim_w;
+    }
+    $('wattsRow').style.display = d.sim_active ? 'flex' : 'none';
+  }
+
+  function showError(msg){
+    $('errorBanner').textContent = msg;
+    $('errorBanner').style.display = 'block';
+    $('dashboard').style.display = 'none';
+  }
+
+  function poll(){
+    fetch('/api/status', {cache:'no-store'}).then(function(r){
+      if (!r.ok) { return r.text().then(function(t){ throw new Error(t || ('HTTP ' + r.status)); }); }
+      return r.json();
+    }).then(function(d){
+      $('errorBanner').style.display = 'none';
+      $('dashboard').style.display = '';
+      render(d);
+    }).catch(function(e){ showError(e.message); });
+  }
+
+  function applyAndRender(url){
+    fetch(url, {cache:'no-store'}).then(function(r){ return r.json(); }).then(render).catch(function(){});
+  }
+
+  document.addEventListener('DOMContentLoaded', function(){
+    $('sourceSelect').addEventListener('change', function(){
+      applyAndRender('/api/set_source?id=' + encodeURIComponent(this.value));
+    });
+    $('simToggle').addEventListener('change', function(){
+      applyAndRender('/api/set?mode=' + (this.checked ? 'sim' : 'real'));
+    });
+    $('wattsApply').addEventListener('click', function(){
+      applyAndRender('/api/set?w=' + encodeURIComponent($('wattsInput').value));
+    });
+    poll();
+    setInterval(poll, 5000);
+  });
+})();
+</script>
+</body>
+</html>
+)PAGE";
 
 static void handle_root() {
     if (!require_auth()) {
         return;
     }
+    s_web_server.send_P(200, "text/html", PAGE_HTML);
+}
 
+// --- JSON status API ---------------------------------------------------
+// Kept file-scope (rather than a stack local) so a deeply nested call chain
+// (WiFi/OTA/WebServer internals all run inside this same task) never has to
+// find room for it on the stack. Much smaller than the old full-HTML buffer
+// since the static shell above no longer needs to be re-rendered per
+// request - this only ever holds compile-time-constant strings plus a
+// couple of numbers, never user-controllable text, so no JSON-escaping is
+// needed.
+static char s_json_body[1536];
+
+static size_t append_sources_json(char *buf, size_t bufSize, size_t offset) {
+    for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < bufSize; i++) {
+        const GridDataSource *src = GRID_SOURCE_REGISTRY[i];
+        offset += snprintf(buf + offset, bufSize - offset,
+            "%s{\"id\":\"%s\",\"name\":\"%s\",\"active\":%s}",
+            (i == 0) ? "" : ",",
+            src->id, src->name,
+            (src == s_active_grid_source) ? "true" : "false");
+    }
+    return offset;
+}
+
+static const char *build_status_json() {
     CpStatus cp = shared_state_get_cp_status_blocking();
 
     uint32_t nowMs = millis();
@@ -194,11 +451,6 @@ static void handle_root() {
         settleRemainingS = (elapsed < SETTLE_MS) ? (SETTLE_MS - elapsed) / 1000 : 0;
     }
 
-    char settleNote[64] = "";
-    if (s_last_decision == DECISION_SETTLING) {
-        snprintf(settleNote, sizeof(settleNote), " (%lus left)", (unsigned long)settleRemainingS);
-    }
-
     char pollAgeStr[24];
     if (everPolled) {
         snprintf(pollAgeStr, sizeof(pollAgeStr), "%lus ago", (unsigned long)pollAgeS);
@@ -210,103 +462,82 @@ static void handle_root() {
         ? "Simulated"
         : s_active_grid_source->name;
 
-    char sourceOptions[384] = "";
-    {
-        size_t offset = 0;
-        for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < sizeof(sourceOptions); i++) {
-            const GridDataSource *src = GRID_SOURCE_REGISTRY[i];
-            offset += snprintf(sourceOptions + offset, sizeof(sourceOptions) - offset,
-                "<option value=\"%s\"%s>%s</option>",
-                src->id,
-                (src == s_active_grid_source) ? " selected" : "",
-                src->name);
-        }
-    }
-
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
         ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
         : "Active - following the solar target below";
+    const char *cpModeLabel = (cp.mode == MODE_BYPASS) ? "Bypass" : "Active";
+    const char *cpModeCls = (cp.mode == MODE_BYPASS) ? "warn" : "ok";
     const char *cpDutyStr = (cp.mode != MODE_ACTIVE)
-        ? "-"
+        ? "Clamp inactive - CP fail-safe bypass, charger running at its native rate"
         : (cp.duty_state == CP_OSCILLATING)
             ? "Oscillating - clamping every cycle to the target duty"
             : "Disconnected - surplus below the 6A floor, CP relay open, not charging";
+    const char *cpDutyLabel = (cp.mode != MODE_ACTIVE)
+        ? "N/A"
+        : (cp.duty_state == CP_OSCILLATING) ? "Oscillating" : "Standby";
+    const char *cpDutyCls = (cp.mode != MODE_ACTIVE)
+        ? "muted"
+        : (cp.duty_state == CP_OSCILLATING) ? "ok" : "warn";
 
-    snprintf(s_page_body, sizeof(s_page_body),
-        "<!DOCTYPE html><html><head><title>solar-ev-charger</title>"
-        "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;line-height:1.5}"
-        "h2{margin-bottom:0.2em}.warn{color:#b00}.ok{color:#080}</style>"
-        "</head><body>"
-        "<h1>Solar control</h1>"
-
-        "<h2>What it's doing right now</h2>"
-        "<p><b>%s</b></p>"
-        "<p>Grid: <b>%.0f W %s</b>%s &mdash; commanded target: <b>%.1f A</b></p>"
-
-        "<h2>Charge point interceptor</h2>"
-        "<p>%s</p>"
-        "<p>%s</p>"
-        "<p>Connector state: <b>%s</b></p>"
-
-        "<h2>Link health</h2>"
-        "<p>WiFi: <span class=\"%s\">%s</span></p>"
-        "<p>Data source: <b>%s</b>%s</p>"
-        "<p>Last successful poll: <b>%s</b>%s</p>"
-
-        "<h2>Grid data source</h2>"
-        "<form action=\"/set_source\" method=\"get\">"
-        "<select name=\"id\">%s</select> "
-        "<input type=\"submit\" value=\"Apply\">"
-        "</form>"
-
-        "<h2>Simulation mode</h2>"
-        "<p>Mode: <b>%s</b></p>"
-        "<p>Simulated grid power: %.0f W (negative = exporting)</p>"
-        "<form action=\"/set\" method=\"get\">"
-        "<label><input type=\"radio\" name=\"mode\" value=\"real\" %s>Real</label><br>"
-        "<label><input type=\"radio\" name=\"mode\" value=\"sim\" %s>Simulated</label><br>"
-        "Simulated watts: <input type=\"number\" name=\"w\" value=\"%.0f\" step=\"50\"><br>"
-        "<input type=\"submit\" value=\"Apply\">"
-        "</form>"
-
-        "<script>"
-        "var wattsFieldFocused=false;"
-        "document.addEventListener('DOMContentLoaded',function(){"
-        "var w=document.querySelector('input[name=w]');"
-        "w.addEventListener('focus',function(){wattsFieldFocused=true;});"
-        "w.addEventListener('blur',function(){wattsFieldFocused=false;});"
-        "});"
-        "setTimeout(function(){if(!wattsFieldFocused){location.reload();}},5000);"
-        "</script>"
-
-        "</body></html>",
+    size_t offset = snprintf(s_json_body, sizeof(s_json_body),
+        "{"
+        "\"decision\":\"%s\","
+        "\"grid_w\":%.0f,"
+        "\"exporting\":%s,"
+        "\"settle_s\":%lu,"
+        "\"target_a\":%.1f,"
+        "\"target_w\":%.0f,"
+        "\"cp_mode\":\"%s\","
+        "\"cp_mode_title\":\"%s\","
+        "\"cp_mode_cls\":\"%s\","
+        "\"cp_duty\":\"%s\","
+        "\"cp_duty_title\":\"%s\","
+        "\"duty_cls\":\"%s\","
+        "\"connector\":\"%s\","
+        "\"connector_title\":\"%s\","
+        "\"connector_cls\":\"%s\","
+        "\"wifi\":%s,"
+        "\"source\":\"%s\","
+        "\"poll_failed\":%s,"
+        "\"poll_age\":\"%s\","
+        "\"stale\":%s,"
+        "\"sim_active\":%s,"
+        "\"sim_w\":%.0f,"
+        "\"sources\":[",
 
         decision_reason_str(s_last_decision),
-        fabsf(surplusW), surplusW >= 0 ? "exporting" : "importing", settleNote,
+        fabsf(surplusW),
+        surplusW >= 0 ? "true" : "false",
+        (unsigned long)settleRemainingS,
         s_last_target_amps,
-
-        cpModeStr,
-        cpDutyStr,
-        connector_state_str(cp.connector_state),
-
-        s_last_solar_status.wifi_connected ? "ok" : "warn",
-        s_last_solar_status.wifi_connected ? "connected" : "disconnected, retrying",
+        s_last_target_amps * MAINS_VOLTAGE_V,
+        cpModeLabel, cpModeStr, cpModeCls,
+        cpDutyLabel, cpDutyStr, cpDutyCls,
+        connector_state_label(cp.connector_state), connector_state_str(cp.connector_state),
+        connector_state_cls(cp.connector_state),
+        s_last_solar_status.wifi_connected ? "true" : "false",
         dataSourceStr,
-        (!s_last_solar_status.simulated && !s_last_solar_status.modbus_ok) ? " - last poll failed" : "",
+        (!s_last_solar_status.simulated && !s_last_solar_status.modbus_ok) ? "true" : "false",
         pollAgeStr,
-        stale ? " <span class=\"warn\">- STALE, CP fail-safe will bypass to native pass-through</span>" : "",
-
-        sourceOptions,
-
-        s_sim_mode_active ? "Simulated" : "Real",
-        s_simulated_grid_power_w,
-        s_sim_mode_active ? "" : "checked",
-        s_sim_mode_active ? "checked" : "",
+        stale ? "true" : "false",
+        s_sim_mode_active ? "true" : "false",
         s_simulated_grid_power_w);
-    s_web_server.send(200, "text/html", s_page_body);
+
+    offset = append_sources_json(s_json_body, sizeof(s_json_body), offset);
+    if (offset < sizeof(s_json_body)) {
+        offset += snprintf(s_json_body + offset, sizeof(s_json_body) - offset, "]}");
+    }
+    return s_json_body;
 }
 
-static void handle_set() {
+static void handle_api_status() {
+    if (!require_auth()) {
+        return;
+    }
+    s_web_server.send(200, "application/json", build_status_json());
+}
+
+static void handle_api_set() {
     if (!require_auth()) {
         return;
     }
@@ -316,11 +547,10 @@ static void handle_set() {
     if (s_web_server.hasArg("w")) {
         s_simulated_grid_power_w = s_web_server.arg("w").toFloat();
     }
-    s_web_server.sendHeader("Location", "/");
-    s_web_server.send(302, "text/plain", "");
+    s_web_server.send(200, "application/json", build_status_json());
 }
 
-static void handle_set_source() {
+static void handle_api_set_source() {
     if (!require_auth()) {
         return;
     }
@@ -331,8 +561,7 @@ static void handle_set_source() {
         // value that would need re-resolving (with a fallback) on next boot.
         save_grid_source_to_nvs(s_active_grid_source->id);
     }
-    s_web_server.sendHeader("Location", "/");
-    s_web_server.send(302, "text/plain", "");
+    s_web_server.send(200, "application/json", build_status_json());
 }
 
 // Route/callback registration: allocates handler objects (WebServer::on()
@@ -349,8 +578,9 @@ static void register_network_services() {
     ArduinoOTA.onError([](ota_error_t error) { Serial.printf("OTA: error %u\n", error); });
 
     s_web_server.on("/", HTTP_GET, handle_root);
-    s_web_server.on("/set", HTTP_GET, handle_set);
-    s_web_server.on("/set_source", HTTP_GET, handle_set_source);
+    s_web_server.on("/api/status", HTTP_GET, handle_api_status);
+    s_web_server.on("/api/set", HTTP_GET, handle_api_set);
+    s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
