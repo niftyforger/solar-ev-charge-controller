@@ -16,8 +16,12 @@
 #define SUNGROW_WINET_MODBUS_TIMEOUT_MS   2000
 
 static bool sungrow_winet_read_power_w(IPAddress host, float &outWatts) {
-    ModbusTcpClient client(host, SUNGROW_WINET_MODBUS_TCP_PORT, SUNGROW_WINET_MODBUS_UNIT_ID,
-                            SUNGROW_WINET_MODBUS_TIMEOUT_MS);
+    // Persistent connection reused across polls (only ever runs serially on
+    // Core 0's solar_control_task, so a function-local static is safe) - see
+    // CLAUDE.md "Firmware implementation".
+    static ModbusTcpClient client(IPAddress(0, 0, 0, 0), SUNGROW_WINET_MODBUS_TCP_PORT,
+                                   SUNGROW_WINET_MODBUS_UNIT_ID, SUNGROW_WINET_MODBUS_TIMEOUT_MS);
+    client.setHost(host);
     uint16_t regs[SUNGROW_WINET_REG_GRID_POWER_COUNT];
     if (!client.readInputRegisters(SUNGROW_WINET_REG_GRID_POWER, SUNGROW_WINET_REG_GRID_POWER_COUNT, regs)) {
         return false;
