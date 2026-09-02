@@ -185,10 +185,14 @@
 // ---------------------------------------------------------------------------
 // Grid data source
 // ---------------------------------------------------------------------------
-// Which meter/inverter link supplies the grid-power figure is modular - see
-// src/grid_data_source.h. Source-specific parameters (Modbus registers,
-// port, unit ID) live with their implementation (e.g. grid_source_sungrow_winet.cpp),
-// not here.
+// Which meter/inverter link supplies the grid-power figure is modular and
+// selected at runtime from the HTTP control page (see src/grid_data_source.h,
+// src/grid_data_source_registry.cpp, and handle_set_source() in
+// solar_control.cpp) - not a compile-time #define. The selection persists
+// across reboots in its own NVS namespace ("gridsrc"), independent of the
+// BLE-provisioned WiFi/inverter config in ble_config.cpp. Source-specific
+// parameters (Modbus registers, port, unit ID) live with their
+// implementation (e.g. grid_source_sungrow_winet.cpp), not here.
 
 // ---------------------------------------------------------------------------
 // FreeRTOS task priorities / core pinning

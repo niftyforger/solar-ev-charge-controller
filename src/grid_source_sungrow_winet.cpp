@@ -38,6 +38,7 @@ static bool sungrow_winet_read_power_w(IPAddress host, float &outWatts) {
 }
 
 const GridDataSource GRID_SOURCE_SUNGROW_WINET = {
+    "sungrow_winet",
     "Sungrow WiNet-S (SH8.0RS)",
     sungrow_winet_read_power_w,
 };
