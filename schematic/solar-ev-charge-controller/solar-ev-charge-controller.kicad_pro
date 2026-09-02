@@ -256,7 +256,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "CCS2_charge_limiter.kicad_pro",
+    "filename": "solar-ev-charge-controller.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -424,12 +424,12 @@
     "subpart_id_separator": 0,
     "top_level_sheets": [
       {
-        "filename": "CCS2_charge_limiter.kicad_sch",
+        "filename": "solar-ev-charge-controller.kicad_sch",
         "name": "Root",
         "uuid": "912c567e-9166-43f7-b746-5b2d116f1c6a"
       }
     ],
-    "used_designators": "U1-4,J1,R1-16,#PWR1-22,D1-4,Q1-3,K1",
+    "used_designators": "U1-6,J1-2,R1-16,#PWR1-24,D1-5,Q1-3,C1-3,K1",
     "variants": []
   },
   "sheets": [

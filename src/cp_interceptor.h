@@ -2,7 +2,7 @@
 
 // Core 1 task, pinned + high priority: real-time CP interception.
 //
-// Captures the Jueclat's native PWM edges via a GPIO interrupt (both edges,
+// Captures the EVSE's native PWM edges via a GPIO interrupt (both edges,
 // microsecond timestamps), and generates the clamp assert/release waveform
 // via the RMT peripheral so the actual pulse timing is hardware-scheduled
 // rather than software-toggled - only the trigger (rising-edge ISR ->

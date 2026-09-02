@@ -2,7 +2,7 @@
 #include "config.h"
 #include "secrets.h"
 #include "shared_state.h"
-#include "modbus_tcp_client.h"
+#include "grid_data_source.h"
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
@@ -71,10 +71,21 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
     return decision;
 }
 
-static void connect_wifi() {
+// WiFi SSID/password have no compile-time fallback - they're provisioned
+// entirely over BLE (see ble_config.cpp) and read here out of shared_state.
+// If the device hasn't been provisioned yet (or the SSID is empty), this
+// deliberately does not call WiFi.begin() at all - retried on the normal
+// WIFI_RECONNECT_INTERVAL_MS cadence until the RuntimeConfig indicates a
+// real SSID exists. Core 1's existing stale-data fail-safe (MODE_BYPASS)
+// already makes "no working network" safe: native CP pass-through, never a
+// guessed setpoint or a disconnect - see CLAUDE.md.
+static void connect_wifi(const RuntimeConfig &cfg) {
+    if (!cfg.provisioned || cfg.ssid[0] == '\0') {
+        return;
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(WIFI_HOSTNAME);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(cfg.ssid, cfg.password);
 }
 
 // --- Sim mode: runtime real/simulated toggle + control page ---------------
@@ -96,8 +107,20 @@ static uint32_t s_last_lastChangeMs = 0;
 
 static WebServer s_web_server(SIM_HTTP_PORT);
 
+// web_password is set entirely over BLE (SET WEB_PASS command, see
+// ble_config.cpp) and has no compile-time fallback - OTA_PASSWORD is used
+// only for OTA flashing (see register_network_services() below), never for
+// this page. Until a web password has been committed at least once, the
+// page refuses every request outright rather than falling back to an
+// empty/guessable credential.
 static bool require_auth() {
-    if (!s_web_server.authenticate("admin", OTA_PASSWORD)) {
+    RuntimeConfig cfg = shared_state_get_runtime_config();
+    if (cfg.web_password[0] == '\0') {
+        s_web_server.send(403, "text/plain",
+            "No control-page password set yet - set one over BLE with SET WEB_PASS <password>.");
+        return false;
+    }
+    if (!s_web_server.authenticate("admin", cfg.web_password)) {
         s_web_server.requestAuthentication();
         return false;
     }
@@ -150,6 +173,10 @@ static void handle_root() {
         snprintf(pollAgeStr, sizeof(pollAgeStr), "never");
     }
 
+    const char *dataSourceStr = s_last_solar_status.simulated
+        ? "Simulated"
+        : ACTIVE_GRID_DATA_SOURCE.name;
+
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
         ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
         : "Active - following the solar target below";
@@ -160,7 +187,7 @@ static void handle_root() {
             : "Disconnected - surplus below the 6A floor, CP relay open, not charging";
 
     snprintf(s_page_body, sizeof(s_page_body),
-        "<!DOCTYPE html><html><head><title>geely-charger-controller</title>"
+        "<!DOCTYPE html><html><head><title>solar-ev-charger</title>"
         "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto;line-height:1.5}"
         "h2{margin-bottom:0.2em}.warn{color:#b00}.ok{color:#080}</style>"
         "</head><body>"
@@ -212,7 +239,7 @@ static void handle_root() {
 
         s_last_solar_status.wifi_connected ? "ok" : "warn",
         s_last_solar_status.wifi_connected ? "connected" : "disconnected, retrying",
-        s_last_solar_status.simulated ? "Simulated" : "Real (Modbus)",
+        dataSourceStr,
         (!s_last_solar_status.simulated && !s_last_solar_status.modbus_ok) ? " - last poll failed" : "",
         pollAgeStr,
         stale ? " <span class=\"warn\">- STALE, CP fail-safe will bypass to native pass-through</span>" : "",
@@ -281,11 +308,16 @@ static void start_network_services() {
 void solar_control_task(void *pvParameters) {
     (void)pvParameters;
 
-    connect_wifi();
+    RuntimeConfig cfg = shared_state_get_runtime_config();
+    uint32_t lastAppliedGeneration = cfg.generation;
+
+    connect_wifi(cfg);
     register_network_services();
 
     IPAddress inverterIp;
-    inverterIp.fromString(INVERTER_IP_ADDR);
+    if (cfg.provisioned) {
+        inverterIp.fromString(cfg.inverter_ip);
+    }
 
     float targetAmps = 0.0f;
     uint32_t lastChangeMs = millis();
@@ -305,6 +337,23 @@ void solar_control_task(void *pvParameters) {
         // updating right up until the hang.
         shared_state_heartbeat_solar_task();
 
+        // Picks up a new SSID/password/inverter IP committed over BLE (see
+        // ble_config.cpp). RuntimeConfig's generation only advances on a
+        // fully-applied BLE COMMIT, so cfg here is always a consistent
+        // snapshot - never a new SSID paired with a stale password.
+        RuntimeConfig freshCfg = shared_state_get_runtime_config();
+        if (freshCfg.generation != lastAppliedGeneration) {
+            lastAppliedGeneration = freshCfg.generation;
+            cfg = freshCfg;
+            if (cfg.provisioned) {
+                inverterIp.fromString(cfg.inverter_ip);
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                WiFi.disconnect();
+            }
+            lastWifiAttemptMs = 0; // reconnect with the new credentials on the next check below
+        }
+
         if (WiFi.status() != WL_CONNECTED) {
             // Drop servicesStarted so the reconnect branch below re-runs
             // start_network_services() once WiFi comes back - see that
@@ -315,7 +364,7 @@ void solar_control_task(void *pvParameters) {
             servicesStarted = false;
             if (now - lastWifiAttemptMs >= WIFI_RECONNECT_INTERVAL_MS) {
                 lastWifiAttemptMs = now;
-                connect_wifi();
+                connect_wifi(cfg);
             }
         } else if (!servicesStarted) {
             start_network_services();
@@ -347,7 +396,7 @@ void solar_control_task(void *pvParameters) {
                 shared_state_set_target_amps(targetAmps);
             } else if (status.wifi_connected) {
                 float gridPowerW;
-                if (modbus_read_grid_power_w(inverterIp, gridPowerW)) {
+                if (ACTIVE_GRID_DATA_SOURCE.read_power_w(inverterIp, gridPowerW)) {
                     status.modbus_ok = true;
                     status.grid_power_w = gridPowerW;
                     lastPollSuccessMs = millis();

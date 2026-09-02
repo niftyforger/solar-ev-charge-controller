@@ -77,7 +77,7 @@ static void IRAM_ATTR schedule_clamp_ticks(uint32_t assertOffsetTicks, uint32_t 
 // timing-critical path now: no queue, no task wakeup, nothing between the
 // real GPIO transition and the timer being armed. Falling edge: opportunistic
 // native high-time learning, same rule as before (skip cycles we clamped,
-// since that edge is our own MOSFET, not the Jueclat's).
+// since that edge is our own MOSFET, not the EVSE's).
 //
 // Bench-confirmed 2026-08-30: CP_PWM_SENSE_GPIO's comparator/opto stage is
 // inverted from the originally-assumed polarity (same fault as
@@ -253,7 +253,7 @@ static ConnectorState read_connector_state() {
     if (notConnected) return CONN_STATE_A;
 
     // Connected. dutyState is our own clamp *decision*, not a measurement
-    // of what the Jueclat is actually driving, so it can't tell us whether
+    // of what the EVSE is actually driving, so it can't tell us whether
     // the line is really oscillating right now - use EDGE_IN activity
     // recency instead (see CP_ACTIVITY_TIMEOUT_US in config.h).
     uint32_t nowUs32 = (uint32_t)esp_timer_get_time();
@@ -452,7 +452,7 @@ void cp_interceptor_task(void *pvParameters) {
         gpio_set_level((gpio_num_t)CP_DISCONNECT_RELAY_GPIO, relayShouldOpen ? 1 : 0);
 
         // Native duty was learned against the pre-disconnect waveform; once
-        // the relay reopens (below) the Jueclat will renegotiate from
+        // the relay reopens (below) the EVSE will renegotiate from
         // scratch with the vehicle, quite possibly at a different native
         // duty. Force a fresh learn after reconnect rather than clamping
         // against stale pre-disconnect timing - reuses the existing

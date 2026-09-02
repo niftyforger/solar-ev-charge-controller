@@ -10,7 +10,7 @@ enum SystemMode {
 enum CpDutyState {
     // While MODE_ACTIVE: surplus is genuinely below the 6A floor (with
     // hysteresis) - the CP disconnect relay is driven open, isolating the
-    // vehicle's CP termination so the Jueclat reads "unplugged" and stops
+    // vehicle's CP termination so the EVSE reads "unplugged" and stops
     // charging on its own. While MODE_BYPASS: just internal bookkeeping: the
     // relay stays closed regardless (see cp_interceptor_task()) - a fault
     // must never trigger a disconnect.
@@ -41,6 +41,20 @@ struct CpStatus {
     float applied_duty_pct;
 };
 
+struct RuntimeConfig {
+    char ssid[33];
+    char password[64];
+    char inverter_ip[16];
+    bool provisioned;
+    uint32_t generation;
+    // BLE-config gate and HTTP control-page passwords - each independent of
+    // OTA_PASSWORD and of each other, empty string meaning "never set" (same
+    // convention as ssid/provisioned above). See CLAUDE.md "BLE
+    // configuration".
+    char ble_password[64];
+    char web_password[64];
+};
+
 // Must be called once from setup() before either core's task starts.
 void shared_state_init();
 
@@ -56,7 +70,6 @@ void shared_state_set_target_amps(float amps);
 // stall the CP task.
 void shared_state_publish_solar_status(const SolarStatus &s);
 bool shared_state_try_get_solar_status(SolarStatus &out); // non-blocking
-SolarStatus shared_state_get_solar_status_blocking();
 
 // --- Core 1 -> Core 0-display: CP telemetry -------------------------------
 // Core 1 publishes with a non-blocking mutex take so a display refresh that
@@ -76,3 +89,22 @@ CpStatus shared_state_get_cp_status_blocking();
 // cp_interceptor_task().
 void shared_state_heartbeat_solar_task();
 uint32_t shared_state_solar_task_heartbeat_age_ms();
+
+// --- BLE (ble_config.cpp) -> Core 0: WiFi + inverter runtime config ------
+// WiFi SSID/password, the inverter IP, and the BLE/web-page passwords are
+// all provisioned entirely over BLE and have no compile-time fallback - see
+// CLAUDE.md "BLE configuration". All setters copy into fixed-size buffers
+// (bounded, always null-terminated) so callers don't need to match
+// RuntimeConfig's exact field sizes.
+//
+// `generation` increments only on shared_state_set_wifi_config() -
+// solar_control_task compares it once per loop iteration and only
+// reconnects WiFi / re-parses the inverter IP when it changes. The two
+// password setters deliberately do NOT touch `generation`: a BLE- or
+// web-page-password change is not a reason for Core 0 to bounce WiFi.
+void shared_state_init_runtime_config(const RuntimeConfig &initial);
+void shared_state_set_wifi_config(const char *ssid, const char *password,
+                                   const char *inverter_ip);
+void shared_state_set_ble_password(const char *password);
+void shared_state_set_web_password(const char *password);
+RuntimeConfig shared_state_get_runtime_config();
