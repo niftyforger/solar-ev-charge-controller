@@ -4,17 +4,33 @@
 ModbusTcpClient::ModbusTcpClient(IPAddress ip, uint16_t port, uint8_t unitId, uint32_t timeoutMs)
     : _ip(ip), _port(port), _unitId(unitId), _timeoutMs(timeoutMs), _transactionId(0) {}
 
+void ModbusTcpClient::setHost(IPAddress ip) {
+    if (ip != _ip) {
+        if (_client.connected()) {
+            _client.stop();
+        }
+        _ip = ip;
+    }
+}
+
+bool ModbusTcpClient::ensureConnected() {
+    if (_client.connected()) {
+        return true;
+    }
+    _client.setTimeout(_timeoutMs);
+    return _client.connect(_ip, _port, _timeoutMs);
+}
+
 bool ModbusTcpClient::readInputRegisters(uint16_t startAddr, uint16_t count, uint16_t *outRegs) {
     if (count == 0 || count > 125) {
         return false;
     }
 
-    WiFiClient client;
-    client.setTimeout(_timeoutMs);
-    if (!client.connect(_ip, _port, _timeoutMs)) {
+    if (!ensureConnected()) {
         return false;
     }
 
+    WiFiClient &client = _client;
     uint16_t txnId = ++_transactionId;
 
     uint8_t request[12];
@@ -90,8 +106,8 @@ bool ModbusTcpClient::readInputRegisters(uint16_t startAddr, uint16_t count, uin
             delay(1);
         }
     }
-    client.stop();
     if (dataRead != byteCount) {
+        client.stop();
         return false;
     }
 
