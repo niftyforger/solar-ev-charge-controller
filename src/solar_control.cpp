@@ -40,14 +40,14 @@ static const char *decision_reason_str(ControlDecision d) {
 // doesn't fight its own effect on the next poll.
 static ControlDecision compute_next_target_amps(float currentTargetA, float gridPowerW,
                                                   uint32_t nowMs, uint32_t &lastChangeMs,
-                                                  float &outTargetA) {
+                                                  float &outTargetA, float mainsVoltageV) {
     if (nowMs - lastChangeMs < SETTLE_MS) {
         outTargetA = currentTargetA;
         return DECISION_SETTLING;
     }
 
     float surplusW = -gridPowerW; // positive = exporting
-    float deltaA = surplusW / MAINS_VOLTAGE_V;
+    float deltaA = surplusW / mainsVoltageV;
     deltaA = constrain(deltaA, -STEP_MAX_A_PER_POLL, STEP_MAX_A_PER_POLL);
 
     float newTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
@@ -89,14 +89,7 @@ static void connect_wifi(const RuntimeConfig &cfg) {
     WiFi.begin(cfg.ssid, cfg.password);
 }
 
-// --- Sim mode: runtime real/simulated toggle + control page ---------------
-// Only ever touched from this task's own loop (the WebServer handler runs
-// synchronously inside handleClient(), called from here), so no mutex is
-// needed for these two.
-static bool s_sim_mode_active = false;
-static float s_simulated_grid_power_w = SIM_DEFAULT_GRID_POWER_W;
-
-// --- Grid data source: runtime-selectable, separate from sim mode ---------
+// --- Grid data source: runtime-selectable from the control page -----------
 // Same ownership as the sim-mode statics above: only Core 0's solar_control_
 // task ever reads or writes this (poll loop + its synchronous WebServer
 // handlers), so no mutex is needed. Always a valid pointer - either this
@@ -125,6 +118,31 @@ static void save_grid_source_to_nvs(const char *id) {
     Preferences prefs;
     prefs.begin(GRID_SOURCE_NVS_NAMESPACE, false);
     prefs.putString("id", id);
+    prefs.end();
+}
+
+// --- Mains voltage: runtime-configurable from the control page ------------
+// Same ownership/no-mutex reasoning as s_active_grid_source above. Not every
+// install is 240V, so this is adjustable rather than the config.h constant
+// it used to be - see MAINS_VOLTAGE_DEFAULT_V.
+static float s_mains_voltage_v = MAINS_VOLTAGE_DEFAULT_V;
+
+static const char *MAINS_VOLTAGE_NVS_NAMESPACE = "pwrcfg";
+
+// Independent of "gridsrc" and BLE's "netcfg" namespaces - its own small
+// HTTP-control-page-managed setting, not a BLE-provisioned one.
+static void load_mains_voltage_from_nvs() {
+    Preferences prefs;
+    prefs.begin(MAINS_VOLTAGE_NVS_NAMESPACE, true);
+    s_mains_voltage_v = prefs.getFloat("voltage", MAINS_VOLTAGE_DEFAULT_V);
+    prefs.end();
+    s_mains_voltage_v = constrain(s_mains_voltage_v, MAINS_VOLTAGE_MIN_V, MAINS_VOLTAGE_MAX_V);
+}
+
+static void save_mains_voltage_to_nvs(float voltageV) {
+    Preferences prefs;
+    prefs.begin(MAINS_VOLTAGE_NVS_NAMESPACE, false);
+    prefs.putFloat("voltage", voltageV);
     prefs.end();
 }
 
@@ -266,14 +284,6 @@ select{width:100%}
 .field label{display:block;color:var(--text-muted);margin-bottom:6px}
 .watts-input-group{display:flex;gap:8px}
 .watts-input-group input[type=number]{flex:1;min-width:0}
-.switch{position:relative;display:inline-block;width:42px;height:24px;flex:none}
-.switch input{opacity:0;width:0;height:0}
-.slider{position:absolute;inset:0;background:var(--muted-bg);border-radius:999px;
-  transition:background .15s;cursor:pointer}
-.slider::before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;
-  background:var(--bg-elev);border-radius:50%;transition:transform .15s;box-shadow:var(--shadow)}
-.switch input:checked+.slider{background:var(--accent)}
-.switch input:checked+.slider::before{transform:translateX(18px)}
 </style>
 </head>
 <body>
@@ -316,15 +326,11 @@ select{width:100%}
           <label for="sourceSelect">Grid source</label>
           <select id="sourceSelect"></select>
         </div>
-        <div class="kv">
-          <span>Simulation mode</span>
-          <label class="switch"><input type="checkbox" id="simToggle"><span class="slider"></span></label>
-        </div>
-        <div class="field" id="wattsRow" style="display:none">
-          <label for="wattsInput">Simulated watts</label>
+        <div class="field">
+          <label for="voltageInput">Mains voltage (V)</label>
           <span class="watts-input-group">
-            <input type="number" id="wattsInput" step="50">
-            <button id="wattsApply" type="button">Apply</button>
+            <input type="number" id="voltageInput" step="1">
+            <button id="voltageApply" type="button">Apply</button>
           </span>
         </div>
       </section>
@@ -360,11 +366,9 @@ select{width:100%}
       }).join('');
     }
 
-    $('simToggle').checked = d.sim_active;
-    if (document.activeElement !== $('wattsInput')) {
-      $('wattsInput').value = d.sim_w;
+    if (document.activeElement !== $('voltageInput')) {
+      $('voltageInput').value = d.voltage_v;
     }
-    $('wattsRow').style.display = d.sim_active ? 'block' : 'none';
   }
 
   function showError(msg){
@@ -392,11 +396,8 @@ select{width:100%}
     $('sourceSelect').addEventListener('change', function(){
       applyAndRender('/api/set_source?id=' + encodeURIComponent(this.value));
     });
-    $('simToggle').addEventListener('change', function(){
-      applyAndRender('/api/set?mode=' + (this.checked ? 'sim' : 'real'));
-    });
-    $('wattsApply').addEventListener('click', function(){
-      applyAndRender('/api/set?w=' + encodeURIComponent($('wattsInput').value));
+    $('voltageApply').addEventListener('click', function(){
+      applyAndRender('/api/set_voltage?v=' + encodeURIComponent($('voltageInput').value));
     });
     poll();
     setInterval(poll, 5000);
@@ -458,9 +459,7 @@ static const char *build_status_json() {
         snprintf(pollAgeStr, sizeof(pollAgeStr), "never");
     }
 
-    const char *dataSourceStr = s_last_solar_status.simulated
-        ? "Simulated"
-        : s_active_grid_source->name;
+    const char *dataSourceStr = s_active_grid_source->name;
 
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
         ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
@@ -501,8 +500,7 @@ static const char *build_status_json() {
         "\"poll_failed\":%s,"
         "\"poll_age\":\"%s\","
         "\"stale\":%s,"
-        "\"sim_active\":%s,"
-        "\"sim_w\":%.0f,"
+        "\"voltage_v\":%.0f,"
         "\"sources\":[",
 
         decision_reason_str(s_last_decision),
@@ -510,18 +508,17 @@ static const char *build_status_json() {
         surplusW >= 0 ? "true" : "false",
         (unsigned long)settleRemainingS,
         s_last_target_amps,
-        s_last_target_amps * MAINS_VOLTAGE_V,
+        s_last_target_amps * s_mains_voltage_v,
         cpModeLabel, cpModeStr, cpModeCls,
         cpDutyLabel, cpDutyStr, cpDutyCls,
         connector_state_label(cp.connector_state), connector_state_str(cp.connector_state),
         connector_state_cls(cp.connector_state),
         s_last_solar_status.wifi_connected ? "true" : "false",
         dataSourceStr,
-        (!s_last_solar_status.simulated && !s_last_solar_status.modbus_ok) ? "true" : "false",
+        !s_last_solar_status.modbus_ok ? "true" : "false",
         pollAgeStr,
         stale ? "true" : "false",
-        s_sim_mode_active ? "true" : "false",
-        s_simulated_grid_power_w);
+        s_mains_voltage_v);
 
     offset = append_sources_json(s_json_body, sizeof(s_json_body), offset);
     if (offset < sizeof(s_json_body)) {
@@ -537,15 +534,15 @@ static void handle_api_status() {
     s_web_server.send(200, "application/json", build_status_json());
 }
 
-static void handle_api_set() {
+static void handle_api_set_voltage() {
     if (!require_auth()) {
         return;
     }
-    if (s_web_server.hasArg("mode")) {
-        s_sim_mode_active = (s_web_server.arg("mode") == "sim");
-    }
-    if (s_web_server.hasArg("w")) {
-        s_simulated_grid_power_w = s_web_server.arg("w").toFloat();
+    if (s_web_server.hasArg("v")) {
+        float voltage = s_web_server.arg("v").toFloat();
+        voltage = constrain(voltage, MAINS_VOLTAGE_MIN_V, MAINS_VOLTAGE_MAX_V);
+        s_mains_voltage_v = voltage;
+        save_mains_voltage_to_nvs(voltage);
     }
     s_web_server.send(200, "application/json", build_status_json());
 }
@@ -579,8 +576,8 @@ static void register_network_services() {
 
     s_web_server.on("/", HTTP_GET, handle_root);
     s_web_server.on("/api/status", HTTP_GET, handle_api_status);
-    s_web_server.on("/api/set", HTTP_GET, handle_api_set);
     s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
+    s_web_server.on("/api/set_voltage", HTTP_GET, handle_api_set_voltage);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
@@ -607,6 +604,7 @@ void solar_control_task(void *pvParameters) {
     RuntimeConfig cfg = shared_state_get_runtime_config();
     uint32_t lastAppliedGeneration = cfg.generation;
     load_grid_source_from_nvs();
+    load_mains_voltage_from_nvs();
 
     connect_wifi(cfg);
     register_network_services();
@@ -680,18 +678,9 @@ void solar_control_task(void *pvParameters) {
             status.wifi_connected = (WiFi.status() == WL_CONNECTED);
             status.modbus_ok = false;
             status.grid_power_w = 0.0f;
-            status.simulated = s_sim_mode_active;
             status.last_poll_success_ms = lastPollSuccessMs;
 
-            if (s_sim_mode_active) {
-                status.modbus_ok = true;
-                status.grid_power_w = s_simulated_grid_power_w;
-                lastPollSuccessMs = millis();
-                status.last_poll_success_ms = lastPollSuccessMs;
-
-                s_last_decision = compute_next_target_amps(targetAmps, s_simulated_grid_power_w, now, lastChangeMs, targetAmps);
-                shared_state_set_target_amps(targetAmps);
-            } else if (status.wifi_connected) {
+            if (status.wifi_connected) {
                 float gridPowerW;
                 if (s_active_grid_source->read_power_w(inverterIp, gridPowerW)) {
                     status.modbus_ok = true;
@@ -699,7 +688,7 @@ void solar_control_task(void *pvParameters) {
                     lastPollSuccessMs = millis();
                     status.last_poll_success_ms = lastPollSuccessMs;
 
-                    s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps);
+                    s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, s_mains_voltage_v);
                     shared_state_set_target_amps(targetAmps);
                 }
             }

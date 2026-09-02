@@ -43,7 +43,19 @@
 
 #define MIN_CURRENT_A            6.0f
 #define MAX_CURRENT_A            32.0f
-#define MAINS_VOLTAGE_V          240.0f
+
+// Mains voltage is runtime-configurable from the HTTP control page (not
+// every install is 240V) and persisted to NVS - see solar_control.cpp's
+// s_mains_voltage_v / load_mains_voltage_from_nvs(). MAINS_VOLTAGE_DEFAULT_V
+// is only the fallback used before any value has ever been persisted.
+// MIN/MAX are input-sanity clamp bounds for /api/set_voltage - prevent a
+// near-zero or absurd value from blowing up compute_next_target_amps()'s
+// division. Placeholder bounds, wide enough to cover single-phase mains
+// worldwide (100V-240V) with margin - narrow if a tighter sanity check is
+// ever wanted.
+#define MAINS_VOLTAGE_DEFAULT_V  240.0f
+#define MAINS_VOLTAGE_MIN_V      100.0f
+#define MAINS_VOLTAGE_MAX_V      300.0f
 
 // Native PWM sanity window (~1kHz nominal, generous guard band against glitches)
 #define NATIVE_PERIOD_MIN_US     800.0
@@ -176,10 +188,10 @@
 // later one gets through.
 #define BLE_IDLE_HELP_INTERVAL_MS  5000UL
 
-// Solar simulation mode (night-time / no-sun bench testing): a WiFi control
-// page toggles between real Modbus readings and this synthetic value. See
-// CLAUDE.md "OTA & simulation mode".
-#define SIM_DEFAULT_GRID_POWER_W  -1000.0f   // negative = exporting
+// HTTP control page port. Night-time / no-sun bench testing uses the fixed
+// simulated grid sources (see grid_source_simulated_export.cpp /
+// grid_source_simulated_import.cpp) selected from this same page rather
+// than a separate sim mode - see CLAUDE.md "Solar data source".
 #define SIM_HTTP_PORT              80
 
 // ---------------------------------------------------------------------------

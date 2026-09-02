@@ -26,9 +26,15 @@ struct GridDataSource {
 // WiNet-S, not the DTSU666-20 meter, is polled directly).
 extern const GridDataSource GRID_SOURCE_SUNGROW_WINET;
 
-// Minimal fixed-value source that exists purely to validate the registry/
-// selector mechanism with more than one entry - see grid_source_stub.cpp.
-extern const GridDataSource GRID_SOURCE_STUB;
+// Fixed-value simulated sources - not real meter integrations. One reports
+// a fixed export figure, the other a fixed import figure, so both the
+// surplus and deficit control-loop paths can be exercised without real
+// solar. Each lives in its own file, one source per file like
+// grid_source_sungrow_winet.cpp, so either can double as a minimal
+// reference when adding a real second source later. See
+// grid_source_simulated_export.cpp / grid_source_simulated_import.cpp.
+extern const GridDataSource GRID_SOURCE_SIMULATED_EXPORT;
+extern const GridDataSource GRID_SOURCE_SIMULATED_IMPORT;
 
 // All sources compiled into this build, selectable at runtime from the HTTP
 // control page (see solar_control.cpp) instead of a compile-time #define.

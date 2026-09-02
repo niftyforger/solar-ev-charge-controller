@@ -7,7 +7,8 @@
 // GRID_SOURCE_SUNGROW_WINET first if this list is ever reordered/extended.
 const GridDataSource *const GRID_SOURCE_REGISTRY[] = {
     &GRID_SOURCE_SUNGROW_WINET,
-    &GRID_SOURCE_STUB,
+    &GRID_SOURCE_SIMULATED_EXPORT,
+    &GRID_SOURCE_SIMULATED_IMPORT,
 };
 const size_t GRID_SOURCE_REGISTRY_COUNT =
     sizeof(GRID_SOURCE_REGISTRY) / sizeof(GRID_SOURCE_REGISTRY[0]);
