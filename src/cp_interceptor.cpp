@@ -11,13 +11,11 @@
 #include <esp_intr_alloc.h>
 #include <esp_system.h>
 
-// Low-level (register-only, force-inlined) HAL headers - see the "fourth
-// deviation" comment block below cp_hw_init() for why these replace the
-// driver/gpio.h, driver/timer.h and driver/rmt.h calls specifically inside
-// the two hot-path ISRs (cp_sense_isr/assert_timer_isr and the
-// schedule_clamp_ticks() helper they call). Those driver-level calls stay in
-// use everywhere else (cp_hw_init()'s one-time setup, task context) since
-// they're not IRAM/ISR-restricted there.
+// Low-level (register-only, force-inlined) HAL headers, used only inside the
+// two hot-path ISRs (cp_sense_isr/assert_timer_isr and the
+// schedule_clamp_ticks() helper they call) - those run with
+// ESP_INTR_FLAG_IRAM (see cp_hw_init()) and so cannot call the flash-resident
+// driver/gpio.h, driver/timer.h, driver/rmt.h APIs used everywhere else.
 #include <hal/gpio_ll.h>
 #include <hal/rmt_ll.h>
 #include <hal/timer_ll.h>
@@ -79,18 +77,13 @@ static void IRAM_ATTR schedule_clamp_ticks(uint32_t assertOffsetTicks, uint32_t 
 // native high-time learning, same rule as before (skip cycles we clamped,
 // since that edge is our own MOSFET, not the EVSE's).
 //
-// Bench-confirmed 2026-08-30: CP_PWM_SENSE_GPIO's comparator/opto stage is
-// inverted from the originally-assumed polarity (same fault as
-// CP_CONNECTED_SENSE_GPIO, already fixed in read_connector_state()) - the
-// raw GPIO reads LOW while the real CP line is in its positive lobe, HIGH
-// while it's in its negative lobe. So the real CP rising edge shows up here
-// as this GPIO's level==0, and the real falling edge as level==1 - the
-// branches below are correct for "real rising"/"real falling" as labeled,
-// only the level==0/level==1 condition needed to flip to match. (Previously
-// level==1 was mistaken for the real rising edge, which armed the clamp
-// timer off the real falling edge instead - reproduced on the bench as
-// CLAMP_DRIVE asserting a duty%-proportional delay after CP's real fall,
-// i.e. clamping into the negative half-cycle.)
+// CP_PWM_SENSE_GPIO's comparator/opto stage is inverted from the naive
+// assumption (same as CP_CONNECTED_SENSE_GPIO): raw GPIO reads LOW during
+// CP's positive lobe, HIGH during the negative lobe. So the real rising edge
+// is level==0 and the real falling edge is level==1 below - get this wrong
+// and the clamp timer arms off the real falling edge instead, asserting into
+// the negative half-cycle (bench-reproduced pre-fix; see CLAUDE.md's
+// "Resolved" section).
 //
 // Deliberately does ZERO floating-point/double arithmetic. ESP32-S3's Xtensa
 // FreeRTOS port saves/restores the floating-point coprocessor lazily, per
@@ -148,18 +141,10 @@ static void cp_hw_init() {
     senseConf.intr_type = GPIO_INTR_ANYEDGE;
     gpio_config(&senseConf);
 
-    // ESP_INTR_FLAG_IRAM (fourth deviation, 2026-08-24 - see the comment
-    // above assert_timer_isr()): an earlier attempt at this flag backfired,
-    // but that was under the second-deviation design, where this ISR's
-    // portYIELD_FROM_ISR() woke cp_interceptor_task to do the scheduling -
-    // resuming a task that runs plenty of ordinary (non-IRAM, flash-resident)
-    // code while the cache could still be disabled. The third deviation
-    // already removed that task hop entirely
-    // (cp_sense_isr() does the scheduling itself, no yield, no queue); this
-    // ISR and everything it calls (schedule_clamp_ticks()) are now raw
-    // register access only (hal/gpio_ll.h, hal/timer_ll.h), so there is no
-    // remaining non-IRAM code on this path for the flag to expose. Same
-    // reasoning applies to the clamp timer ISR below.
+    // ESP_INTR_FLAG_IRAM: safe here because this ISR and everything it calls
+    // (schedule_clamp_ticks()) are raw register access only (hal/gpio_ll.h,
+    // hal/timer_ll.h) - no flash-resident code remains on the path for the
+    // flag to expose. Same reasoning applies to the clamp timer ISR below.
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     gpio_isr_handler_add((gpio_num_t)CP_PWM_SENSE_GPIO, cp_sense_isr, nullptr);
 
@@ -185,21 +170,15 @@ static void cp_hw_init() {
     rmt_set_source_clk(CP_RMT_TX_CHANNEL, RMT_BASECLK_APB); // pin the clock the RMT tick math assumes
 
     // Free-running hardware timer, alarm-triggered to fire assert_timer_isr()
-    // at the intended assert instant. Superseded an esp_timer one-shot
-    // (ESP_TIMER_TASK dispatch, since ESP_TIMER_ISR isn't available in this
-    // build - CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD is unset) because
-    // that dispatch went through a FreeRTOS task wakeup - real jitter
-    // (110-338us, bench-measured 2026-08-24) from scheduling variance, worse
-    // because the esp_timer task isn't core-pinned and could land on Core 0
-    // while it's busy with WiFi/Modbus/OTA. timer_isr_callback_add() runs
-    // assert_timer_isr() directly in interrupt context instead - no task
-    // wakeup in the loop at all. One-time setup here (timer_init() etc.)
-    // stays on the regular driver/timer.h API - it's task-context, not
-    // time-critical. ESP_INTR_FLAG_IRAM alloc flag (fourth deviation,
-    // 2026-08-24): see the gpio_install_isr_service comment above and the
-    // block above assert_timer_isr() for why this is now safe (no non-IRAM
-    // code left on the fired-ISR path) and why it was needed (closing the
-    // flash-cache-disable-deferral jitter gap).
+    // directly in interrupt context at the intended assert instant.
+    // Supersedes an esp_timer one-shot, which dispatched via a FreeRTOS task
+    // wakeup (ESP_TIMER_ISR dispatch isn't available in this build) and
+    // carried real jitter (110-338us, bench-measured) since that task isn't
+    // core-pinned and could land on Core 0 while it's busy with WiFi/Modbus/
+    // OTA. One-time setup here (timer_init() etc.) stays on the regular
+    // driver/timer.h API since it's task-context, not time-critical; the
+    // ESP_INTR_FLAG_IRAM alloc flag below is safe for the same reason as the
+    // gpio_install_isr_service call above.
     timer_config_t clampTimerConfig = {};
     clampTimerConfig.alarm_en = TIMER_ALARM_DIS;
     clampTimerConfig.counter_en = TIMER_PAUSE;
@@ -278,21 +257,14 @@ static ConnectorState read_connector_state() {
 // below), directly in interrupt context - no FreeRTOS task wakeup in this
 // path.
 //
-// Fourth deviation (bench-tested 2026-08-24, same day as the recalibration
-// above): registered with ESP_INTR_FLAG_IRAM (see cp_hw_init()), so this and
-// cp_sense_isr() now keep running even inside a flash-cache-disable window
+// Registered with ESP_INTR_FLAG_IRAM (see cp_hw_init()), so this and
+// cp_sense_isr() keep running even inside a flash-cache-disable window
 // (WiFi/NVS activity elsewhere) instead of being deferred until it ends -
-// that deferral was the dominant source of the 75-166us dispatch jitter
-// measured against the third deviation (queue-free, direct-ISR-arm) design.
-// The IDF docs for timer_isr_callback_add()/gpio_isr_handler_add() are
-// explicit that an ESP_INTR_FLAG_IRAM handler "cannot call other timer
-// APIs... use direct register access" - so every call in this function and
-// in schedule_clamp_ticks()/cp_sense_isr() had to move off the driver-level
-// driver/rmt.h and driver/timer.h calls (rmt_write_items(),
-// timer_group_clr_intr_status_in_isr(), timer_set_alarm() etc. - all
-// flash-resident, non-IRAM) onto the force-inlined, register-only hal/*_ll.h
-// equivalents, which carry no such restriction since they compile directly
-// into this IRAM_ATTR function's own IRAM-resident body.
+// that deferral was the dominant source of dispatch jitter (75-166us,
+// bench-measured) in an earlier, non-IRAM design. An IRAM handler cannot
+// call flash-resident driver APIs, so every call in this function and in
+// schedule_clamp_ticks()/cp_sense_isr() uses the force-inlined, register-only
+// hal/*_ll.h equivalents instead of driver/rmt.h and driver/timer.h.
 //
 // Writes a single RMT item that asserts (HIGH) immediately and releases
 // after holdTicks - the hold duration lives in the item's *second* segment
@@ -374,13 +346,7 @@ void cp_interceptor_task(void *pvParameters) {
             stale = !have || (millis() - solar.last_poll_success_ms > STALE_DATA_TIMEOUT_MS);
 
             // Independent recovery watchdog for a wedged Core 0 - see
-            // SOLAR_TASK_HEARTBEAT_TIMEOUT_MS in config.h for why this is
-            // separate from CP_TASK_WDT_TIMEOUT_MS/esp_task_wdt above. The
-            // `stale` path already fails the CP task safely open (bypass to
-            // native pass-through) the moment Core 0 stops publishing fresh
-            // polls; this goes one step further and actually recovers the
-            // system automatically, rather than leaving it bypassed until
-            // someone notices and power-cycles the board.
+            // shared_state_heartbeat_solar_task()'s comment in shared_state.h.
             if (shared_state_solar_task_heartbeat_age_ms() > SOLAR_TASK_HEARTBEAT_TIMEOUT_MS) {
                 Serial.println("solar_control_task heartbeat stale - Core 0 appears wedged, restarting");
                 Serial.flush();
@@ -403,27 +369,21 @@ void cp_interceptor_task(void *pvParameters) {
         bool nativeHighKnown = s_nativeHighKnown;
 
         // MIN_CURRENT_A (10% duty) is itself a fully valid, spec-legal CP
-        // signal, not a marginal one - there's no reason to withhold
-        // OSCILLATING right at the floor when approaching from STANDBY, so
-        // entry uses the bare floor with no extra margin. The hysteresis
-        // margin instead sits on the *exit* side: once already
-        // OSCILLATING, don't drop back to STANDBY until target falls
-        // meaningfully below the floor, so noise sitting right at
-        // MIN_CURRENT_A can't flap the clamp on/off every planning pass.
-        // (Bench-caught 2026-08-24: the previous version put the margin on
-        // entry instead - targetAmps had to clear MIN_CURRENT_A+HYSTERESIS_A
-        // before ever leaving STANDBY, so settling exactly at the 6.0A
-        // floor produced no clamp signal at all; only settling at 8.0A did.)
+        // signal, so entry into OSCILLATING uses the bare floor with no
+        // extra margin. The hysteresis margin sits only on the *exit* side
+        // (don't drop back to STANDBY until target falls meaningfully below
+        // the floor), so noise sitting right at MIN_CURRENT_A can't flap the
+        // clamp every planning pass - putting the margin on entry instead
+        // caused settling exactly at the floor to never leave STANDBY at all
+        // (see CLAUDE.md's "Resolved" section).
         //
-        // CP_STANDBY while MODE_ACTIVE now drives the disconnect relay open
-        // (see relayShouldOpen below) rather than releasing the clamp to
-        // native pass-through - releasing to native was the bug this
-        // replaced: it handed the vehicle full uncapped current at exactly
-        // the moment surplus was lowest. Opening the relay on top of the
-        // existing amps hysteresis is gated by its own dwell timer
-        // (RELAY_MIN_DWELL_MS) below, since a real disconnect forces a fresh
-        // unplug/replug handshake and shouldn't retrigger faster than that
-        // can complete.
+        // CP_STANDBY while MODE_ACTIVE drives the disconnect relay open (see
+        // relayShouldOpen below) rather than releasing the clamp to native
+        // pass-through, which would hand the vehicle full uncapped current
+        // at exactly the moment surplus was lowest. Opening the relay is
+        // additionally gated by its own dwell timer (RELAY_MIN_DWELL_MS)
+        // below, since a real disconnect forces a fresh unplug/replug
+        // handshake and shouldn't retrigger faster than that can complete.
         CpDutyState prevDutyState = dutyState;
         uint32_t nowMs = (uint32_t)(now / 1000);
         if (mode == MODE_ACTIVE) {
