@@ -30,6 +30,20 @@ struct SolarStatus {
     uint32_t last_poll_success_ms;
     bool wifi_connected;
     bool modbus_ok;
+    // Independent liveness path for scheduled (fixed-current) charging - see
+    // CLAUDE.md "Solar data source" and cp_interceptor_task()'s staleness
+    // check. schedule_active is whether solar_control_task's most recent
+    // loop tick found an enabled schedule whose UTC window covers "now";
+    // last_schedule_confirm_ms only advances while that's true (carried
+    // forward otherwise), so it ages past STALE_DATA_TIMEOUT_MS on its own
+    // once the window ends or NTP/WiFi/Core 0 stops confirming it - no
+    // separate timeout constant or transition-handling code needed. This
+    // lets MODE_ACTIVE stay reachable purely from a fresh schedule
+    // confirmation even while last_poll_success_ms is stale (e.g. the
+    // inverter/Modbus link is down), which is the whole point: a fixed-
+    // current schedule must not depend on the solar grid-data pipeline.
+    bool schedule_active;
+    uint32_t last_schedule_confirm_ms;
 };
 
 struct CpStatus {

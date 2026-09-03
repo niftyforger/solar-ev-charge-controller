@@ -190,6 +190,26 @@
 #define SIM_HTTP_PORT              80
 
 // ---------------------------------------------------------------------------
+// Scheduled (fixed-current) charging
+//
+// No RTC/timezone/DST logic on-device by design: the board syncs via NTP to
+// UTC only, the schedule's start/end are stored and evaluated in UTC, and
+// the control page's own JS converts to/from the viewer's local time at
+// edit/display time using the browser's Date object - see solar_control.cpp's
+// PAGE_HTML. This also means a DST transition never needs a firmware update
+// or manual re-entry - the browser just re-converts correctly next time the
+// page is opened.
+// ---------------------------------------------------------------------------
+#define NTP_SERVER                 "pool.ntp.org"
+
+// Below this, time(nullptr) is treated as "NTP hasn't synced yet" rather
+// than a real timestamp - the ESP32's clock starts at an epoch far in the
+// past (0, or the mid-2000s depending on core version) until SNTP first
+// succeeds. A fixed point comfortably in the past (2023-11-14) rather than
+// "now" so this constant never needs bumping.
+#define NTP_MIN_VALID_EPOCH        1700000000UL
+
+// ---------------------------------------------------------------------------
 // Grid data source
 // ---------------------------------------------------------------------------
 // Which meter/inverter link supplies the grid-power figure is modular and
