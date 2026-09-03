@@ -343,7 +343,18 @@ void cp_interceptor_task(void *pvParameters) {
             lastStaleCheckUs = now;
             SolarStatus solar;
             bool have = shared_state_try_get_solar_status(solar);
-            stale = !have || (millis() - solar.last_poll_success_ms > STALE_DATA_TIMEOUT_MS);
+            // Two independent freshness paths, either of which is enough to
+            // stay MODE_ACTIVE: a recently-successful grid-data poll (solar-
+            // following), or a recently-confirmed scheduled fixed-current
+            // window (see SolarStatus's schedule_active/last_schedule_confirm_ms
+            // comment in shared_state.h) - a scheduled charge must not
+            // depend on the inverter/Modbus link being up. Only when BOTH
+            // are stale does this fall back to native pass-through, same
+            // STALE_DATA_TIMEOUT_MS budget and MODE_BYPASS mechanism as
+            // before - no new fail-safe timeout.
+            bool gridStale = !have || (millis() - solar.last_poll_success_ms > STALE_DATA_TIMEOUT_MS);
+            bool scheduleStale = !have || (millis() - solar.last_schedule_confirm_ms > STALE_DATA_TIMEOUT_MS);
+            stale = gridStale && scheduleStale;
 
             // Independent recovery watchdog for a wedged Core 0 - see
             // shared_state_heartbeat_solar_task()'s comment in shared_state.h.

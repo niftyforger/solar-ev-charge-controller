@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
 
 // What the control law just did, kept alongside the numeric target so the
 // web UI can explain the decision in words instead of just showing a number.
@@ -18,6 +19,7 @@ enum ControlDecision {
     DECISION_HOLD,         // already matched to surplus, no change needed
     DECISION_CAPPED_MAX,   // would go higher, but MAX_CURRENT_A is the ceiling
     DECISION_CAPPED_ZERO,  // no surplus at all, held at the floor
+    DECISION_SCHEDULE_OVERRIDE, // fixed-current schedule window active - solar reading ignored
 };
 
 static const char *decision_reason_str(ControlDecision d) {
@@ -28,6 +30,7 @@ static const char *decision_reason_str(ControlDecision d) {
         case DECISION_CAPPED_MAX:  return "Holding at max - surplus exceeds charger's limit";
         case DECISION_CAPPED_ZERO: return "Holding at 0A - no surplus available";
         case DECISION_HOLD:        return "Holding - matched to surplus";
+        case DECISION_SCHEDULE_OVERRIDE: return "Scheduled charging - fixed current, solar reading ignored";
         default:                   return "";
     }
 }
@@ -144,6 +147,73 @@ static void save_grid_source_to_nvs(const char *id) {
     prefs.begin(GRID_SOURCE_NVS_NAMESPACE, false);
     prefs.putString("id", id);
     prefs.end();
+}
+
+// --- Scheduled (fixed-current) charging ------------------------------------
+// A control-page-owned setting, same ownership/mutex-free reasoning as
+// s_active_grid_source above (only Core 0's own task + its synchronous
+// WebServer handlers ever touch it) and its own NVS namespace, independent
+// of both ble_config.cpp's "netcfg" and GRID_SOURCE_NVS_NAMESPACE - see
+// CLAUDE.md "Solar data source" / config.h's scheduled-charging section.
+//
+// start_min/end_min are UTC minutes-since-midnight. Storing/evaluating in
+// UTC keeps all timezone/DST conversion in the browser (see PAGE_HTML's JS)
+// rather than needing a TZ rule on-device.
+struct ScheduleConfig {
+    bool enabled;
+    uint16_t start_min;
+    uint16_t end_min;
+    float amps;
+};
+static ScheduleConfig s_schedule = { false, 0, 0, MIN_CURRENT_A };
+
+static const char *SCHEDULE_NVS_NAMESPACE = "schedule";
+
+static void load_schedule_from_nvs() {
+    Preferences prefs;
+    prefs.begin(SCHEDULE_NVS_NAMESPACE, true);
+    s_schedule.enabled = prefs.getBool("en", false);
+    s_schedule.start_min = prefs.getUShort("sm", 0);
+    s_schedule.end_min = prefs.getUShort("em", 0);
+    s_schedule.amps = prefs.getFloat("amps", MIN_CURRENT_A);
+    prefs.end();
+}
+
+static void save_schedule_to_nvs() {
+    Preferences prefs;
+    prefs.begin(SCHEDULE_NVS_NAMESPACE, false);
+    prefs.putBool("en", s_schedule.enabled);
+    prefs.putUShort("sm", s_schedule.start_min);
+    prefs.putUShort("em", s_schedule.end_min);
+    prefs.putFloat("amps", s_schedule.amps);
+    prefs.end();
+}
+
+// False until NTP has genuinely synced at least once (see NTP_MIN_VALID_EPOCH
+// in config.h) - a schedule must never activate against a guessed/default
+// clock. configTime() is kicked off in start_network_services() below.
+static bool get_utc_now(struct tm &outTm) {
+    time_t nowEpoch = time(nullptr);
+    if (nowEpoch < (time_t)NTP_MIN_VALID_EPOCH) {
+        return false;
+    }
+    gmtime_r(&nowEpoch, &outTm);
+    return true;
+}
+
+// [start_min, end_min) in UTC minutes-since-midnight, wrapping past midnight
+// when end_min <= start_min (e.g. a 23:00-06:00 off-peak window). Equal
+// start/end is treated as "never active" rather than "always active" - a
+// full-day schedule is just 00:00-23:59.
+static bool is_schedule_window_now(const ScheduleConfig &s, const struct tm &utcNow) {
+    if (s.start_min == s.end_min) {
+        return false;
+    }
+    uint16_t nowMin = (uint16_t)(utcNow.tm_hour * 60 + utcNow.tm_min);
+    if (s.start_min < s.end_min) {
+        return nowMin >= s.start_min && nowMin < s.end_min;
+    }
+    return nowMin >= s.start_min || nowMin < s.end_min;
 }
 
 // Grid voltage is no longer a manually-configured global setting - it comes
@@ -331,6 +401,30 @@ select{width:100%}
           Data is stale &mdash; CP will fail safe to native pass-through.
         </div>
       </section>
+
+      <section class="card card-settings">
+        <h2>Schedule</h2>
+        <div class="field">
+          <label><input type="checkbox" id="scheduleEnabled"> Enabled</label>
+        </div>
+        <div class="field">
+          <label for="scheduleStart">Start (local)</label>
+          <input type="time" id="scheduleStart">
+        </div>
+        <div class="field">
+          <label for="scheduleEnd">End (local)</label>
+          <input type="time" id="scheduleEnd">
+        </div>
+        <div class="field">
+          <label for="scheduleAmps">Current (A)</label>
+          <input type="number" id="scheduleAmps" min="6" max="32" step="0.1">
+        </div>
+        <div class="field">
+          <button id="scheduleSaveBtn" type="button">Save</button>
+          <span id="scheduleActiveBadge"></span>
+        </div>
+        <div id="timeSyncWarn" class="stat-sub" style="display:none;color:var(--warn)">Waiting for time sync&hellip;</div>
+      </section>
     </div>
   </div>
 </div>
@@ -339,6 +433,27 @@ select{width:100%}
   function $(id){ return document.getElementById(id); }
   function badge(cls, text, title){
     return '<span class="badge badge-' + cls + '"' + (title ? ' title="' + title + '"' : '') + '>' + text + '</span>';
+  }
+  function pad2(n){ return String(n).padStart(2, '0'); }
+
+  // Schedule times are stored/sent as "HH:MM" UTC; these fields are what
+  // the <input type=time> shows/accepts, which is always local time - the
+  // browser's own Date knows the current offset (DST included), so no
+  // timezone/DST logic needs to live on the device at all.
+  function utcHHMMToLocal(utcHHMM){
+    var parts = utcHHMM.split(':');
+    var d = new Date(Date.UTC(1970, 0, 1, +parts[0], +parts[1]));
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+  function localHHMMToUtc(localHHMM){
+    var parts = localHHMM.split(':');
+    var d = new Date();
+    d.setHours(+parts[0], +parts[1], 0, 0);
+    return pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes());
+  }
+  var SCHEDULE_FIELD_IDS = ['scheduleEnabled', 'scheduleStart', 'scheduleEnd', 'scheduleAmps'];
+  function scheduleFieldFocused(){
+    return SCHEDULE_FIELD_IDS.indexOf(document.activeElement && document.activeElement.id) !== -1;
   }
 
   function render(d){
@@ -364,6 +479,15 @@ select{width:100%}
     }
 
     $('voltageDisplay').textContent = d.voltage_v.toFixed(0) + ' V';
+
+    if (!scheduleFieldFocused()) {
+      $('scheduleEnabled').checked = d.schedule_enabled;
+      $('scheduleStart').value = utcHHMMToLocal(d.schedule_start_utc);
+      $('scheduleEnd').value = utcHHMMToLocal(d.schedule_end_utc);
+      $('scheduleAmps').value = d.schedule_amps;
+    }
+    $('scheduleActiveBadge').innerHTML = d.schedule_active ? badge('ok', 'Active now') : '';
+    $('timeSyncWarn').style.display = d.time_synced ? 'none' : '';
   }
 
   function showError(msg){
@@ -391,6 +515,14 @@ select{width:100%}
     $('sourceSelect').addEventListener('change', function(){
       applyAndRender('/api/set_source?id=' + encodeURIComponent(this.value));
     });
+    $('scheduleSaveBtn').addEventListener('click', function(){
+      var url = '/api/set_schedule'
+        + '?enabled=' + ($('scheduleEnabled').checked ? '1' : '0')
+        + '&start=' + encodeURIComponent(localHHMMToUtc($('scheduleStart').value))
+        + '&end=' + encodeURIComponent(localHHMMToUtc($('scheduleEnd').value))
+        + '&amps=' + encodeURIComponent($('scheduleAmps').value);
+      applyAndRender(url);
+    });
     poll();
     setInterval(poll, 5000);
   });
@@ -415,7 +547,7 @@ static void handle_root() {
 // request - this only ever holds compile-time-constant strings plus a
 // couple of numbers, never user-controllable text, so no JSON-escaping is
 // needed.
-static char s_json_body[1536];
+static char s_json_body[1792];
 
 static size_t append_sources_json(char *buf, size_t bufSize, size_t offset) {
     for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < bufSize; i++) {
@@ -452,6 +584,12 @@ static const char *build_status_json() {
     }
 
     const char *dataSourceStr = s_active_grid_source->name;
+
+    char scheduleStartStr[6], scheduleEndStr[6];
+    snprintf(scheduleStartStr, sizeof(scheduleStartStr), "%02u:%02u", s_schedule.start_min / 60, s_schedule.start_min % 60);
+    snprintf(scheduleEndStr, sizeof(scheduleEndStr), "%02u:%02u", s_schedule.end_min / 60, s_schedule.end_min % 60);
+    struct tm utcNowForStatus;
+    bool timeSyncedForStatus = get_utc_now(utcNowForStatus);
 
     const char *cpModeStr = (cp.mode == MODE_BYPASS)
         ? "Bypass - stale/unavailable data, clamp released, charger running at its native rate (disconnect relay stays closed)"
@@ -493,6 +631,12 @@ static const char *build_status_json() {
         "\"poll_age\":\"%s\","
         "\"stale\":%s,"
         "\"voltage_v\":%.0f,"
+        "\"schedule_enabled\":%s,"
+        "\"schedule_start_utc\":\"%s\","
+        "\"schedule_end_utc\":\"%s\","
+        "\"schedule_amps\":%.1f,"
+        "\"schedule_active\":%s,"
+        "\"time_synced\":%s,"
         "\"sources\":[",
 
         decision_reason_str(s_last_decision),
@@ -510,7 +654,13 @@ static const char *build_status_json() {
         !s_last_solar_status.modbus_ok ? "true" : "false",
         pollAgeStr,
         stale ? "true" : "false",
-        s_last_mains_voltage_v);
+        s_last_mains_voltage_v,
+        s_schedule.enabled ? "true" : "false",
+        scheduleStartStr,
+        scheduleEndStr,
+        s_schedule.amps,
+        s_last_solar_status.schedule_active ? "true" : "false",
+        timeSyncedForStatus ? "true" : "false");
 
     offset = append_sources_json(s_json_body, sizeof(s_json_body), offset);
     if (offset < sizeof(s_json_body)) {
@@ -540,6 +690,49 @@ static void handle_api_set_source() {
     s_web_server.send(200, "application/json", build_status_json());
 }
 
+// start/end arrive as "HH:MM" UTC (the control page's JS converts from the
+// viewer's local time before sending - see PAGE_HTML). A malformed value is
+// simply ignored, leaving the previously-saved field in place, same
+// leave-prior-value-on-bad-input pattern as SET INVERTER_IP over BLE.
+static bool parse_hhmm_utc(const String &s, uint16_t &outMin) {
+    int h, m;
+    if (sscanf(s.c_str(), "%d:%d", &h, &m) != 2) {
+        return false;
+    }
+    if (h < 0 || h > 23 || m < 0 || m > 59) {
+        return false;
+    }
+    outMin = (uint16_t)(h * 60 + m);
+    return true;
+}
+
+static void handle_api_set_schedule() {
+    if (!require_auth()) {
+        return;
+    }
+    if (s_web_server.hasArg("enabled")) {
+        s_schedule.enabled = s_web_server.arg("enabled") == "1";
+    }
+    if (s_web_server.hasArg("start")) {
+        uint16_t m;
+        if (parse_hhmm_utc(s_web_server.arg("start"), m)) {
+            s_schedule.start_min = m;
+        }
+    }
+    if (s_web_server.hasArg("end")) {
+        uint16_t m;
+        if (parse_hhmm_utc(s_web_server.arg("end"), m)) {
+            s_schedule.end_min = m;
+        }
+    }
+    if (s_web_server.hasArg("amps")) {
+        float a = s_web_server.arg("amps").toFloat();
+        s_schedule.amps = constrain(a, MIN_CURRENT_A, MAX_CURRENT_A);
+    }
+    save_schedule_to_nvs();
+    s_web_server.send(200, "application/json", build_status_json());
+}
+
 // Route/callback registration: allocates handler objects (WebServer::on()
 // appends a new FunctionRequestHandler to an internal linked list every
 // call, never replacing an existing one), so this must run exactly once for
@@ -556,6 +749,7 @@ static void register_network_services() {
     s_web_server.on("/", HTTP_GET, handle_root);
     s_web_server.on("/api/status", HTTP_GET, handle_api_status);
     s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
+    s_web_server.on("/api/set_schedule", HTTP_GET, handle_api_set_schedule);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
@@ -574,6 +768,13 @@ static void start_network_services() {
 
     ArduinoOTA.begin();
     s_web_server.begin();
+
+    // UTC only, deliberately zero UTC/DST offsets - see config.h's scheduled-
+    // charging section for why timezone conversion lives in the browser
+    // instead of on-device. Re-issued on every reconnect alongside OTA/
+    // WebServer above so SNTP re-resolves NTP_SERVER against whatever DNS
+    // the current connection provides.
+    configTime(0, 0, NTP_SERVER);
 }
 
 void solar_control_task(void *pvParameters) {
@@ -582,6 +783,7 @@ void solar_control_task(void *pvParameters) {
     RuntimeConfig cfg = shared_state_get_runtime_config();
     uint32_t lastAppliedGeneration = cfg.generation;
     load_grid_source_from_nvs();
+    load_schedule_from_nvs();
 
     connect_wifi(cfg);
     register_network_services();
@@ -651,11 +853,34 @@ void solar_control_task(void *pvParameters) {
         if (now - lastPollMs >= POLL_INTERVAL_MS) {
             lastPollMs = now;
 
+            // Evaluated every poll tick regardless of WiFi/Modbus outcome
+            // below - a scheduled fixed-current charge must not depend on
+            // the grid-data pipeline (see CLAUDE.md "Solar data source" and
+            // cp_interceptor.cpp's staleness check).
+            struct tm utcNow;
+            bool timeSynced = get_utc_now(utcNow);
+            bool scheduleActive = timeSynced && s_schedule.enabled && is_schedule_window_now(s_schedule, utcNow);
+
             SolarStatus status;
             status.wifi_connected = (WiFi.status() == WL_CONNECTED);
             status.modbus_ok = false;
             status.grid_power_w = 0.0f;
             status.last_poll_success_ms = lastPollSuccessMs;
+            status.schedule_active = scheduleActive;
+            // Carried forward (not reset to 0) when inactive, so it ages
+            // past STALE_DATA_TIMEOUT_MS on its own once the window ends -
+            // see the field's comment in shared_state.h.
+            status.last_schedule_confirm_ms = scheduleActive ? millis() : s_last_solar_status.last_schedule_confirm_ms;
+
+            if (scheduleActive) {
+                targetAmps = constrain(s_schedule.amps, MIN_CURRENT_A, MAX_CURRENT_A);
+                shared_state_set_target_amps(targetAmps);
+                // Fresh settle window for solar control's own hysteresis the
+                // moment the schedule ends - targetAmps was just set from
+                // the schedule, not derived from a surplus reading.
+                lastChangeMs = now;
+                s_last_decision = DECISION_SCHEDULE_OVERRIDE;
+            }
 
             if (status.wifi_connected) {
                 float gridPowerW;
@@ -671,10 +896,15 @@ void solar_control_task(void *pvParameters) {
                     status.grid_power_w = gridPowerW;
                     lastPollSuccessMs = millis();
                     status.last_poll_success_ms = lastPollSuccessMs;
-
-                    s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, voltageV);
-                    shared_state_set_target_amps(targetAmps);
                     s_last_mains_voltage_v = voltageV;
+
+                    // Polling still runs (and still updates status/display)
+                    // during a schedule window - it just stops feeding the
+                    // control law while the schedule is in charge.
+                    if (!scheduleActive) {
+                        s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, voltageV);
+                        shared_state_set_target_amps(targetAmps);
+                    }
                 }
             }
 
