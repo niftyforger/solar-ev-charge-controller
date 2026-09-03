@@ -314,26 +314,21 @@ select{width:100%}
 
       <section class="card">
         <h2>Charge point</h2>
-        <div class="kv"><span>Mode</span><span id="cpMode">--</span></div>
-        <div class="kv"><span>Clamp</span><span id="cpDuty">--</span></div>
+        <div class="kv"><span>Solar control</span><span id="cpMode">--</span></div>
+        <div class="kv"><span>Charging status</span><span id="cpDuty">--</span></div>
         <div class="kv"><span>Connector</span><span id="connector">--</span></div>
       </section>
 
-      <section class="card">
-        <h2>Link health</h2>
-        <div class="kv"><span>Data source</span><span id="sourceName">--</span></div>
+      <section class="card card-settings">
+        <h2>Data source</h2>
+        <div class="field">
+          <select id="sourceSelect"></select>
+          <div class="stat-sub" id="pollFailedNote" style="display:none;color:var(--bad)">Last poll failed</div>
+        </div>
         <div class="kv"><span>Voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
           Data is stale &mdash; CP will fail safe to native pass-through.
-        </div>
-      </section>
-
-      <section class="card card-settings">
-        <h2>Settings</h2>
-        <div class="field">
-          <label for="sourceSelect">Grid source</label>
-          <select id="sourceSelect"></select>
         </div>
       </section>
     </div>
@@ -358,7 +353,7 @@ select{width:100%}
     $('connector').innerHTML = badge(d.connector_cls, d.connector, d.connector_title);
 
     $('wifiPill').innerHTML = badge(d.wifi ? 'ok' : 'bad', d.wifi ? 'Wi-Fi connected' : 'Wi-Fi disconnected');
-    $('sourceName').textContent = d.source + (d.poll_failed ? ' (last poll failed)' : '');
+    $('pollFailedNote').style.display = d.poll_failed ? '' : 'none';
     $('pollAge').textContent = d.poll_age;
     $('staleWarn').style.display = d.stale ? 'block' : 'none';
 
