@@ -9,8 +9,17 @@
 // wiring behind it - see CLAUDE.md "Solar data source".
 //
 // Reads current grid power in watts, negative = exporting (same convention
-// used everywhere else in this codebase). Returns true on success.
-typedef bool (*GridDataSourceReadFn)(IPAddress host, float &outWatts);
+// used everywhere else in this codebase), and the AC grid/mains voltage in
+// volts. currentDrawW is the wattage the control loop is currently
+// commanding for charging (targetAmps * mainsVoltageV) - a real meter's
+// power reading already nets this out on its own, so real sources ignore
+// it; it exists for simulated sources that need to model that feedback
+// themselves (see grid_source_simulated_reactive_moderate.cpp and siblings).
+// outVoltageV lets each source report its own grid voltage rather than
+// relying on one manually-configured global value - GRID_SOURCE_SUNGROW_WINET
+// reads the real value from the inverter, every simulated source reports a
+// fixed MAINS_VOLTAGE_FIXED_V (config.h). Returns true on success.
+typedef bool (*GridDataSourceReadFn)(IPAddress host, float currentDrawW, float &outWatts, float &outVoltageV);
 
 struct GridDataSource {
     // Short, stable machine key (e.g. "sungrow_winet"). This is what gets
@@ -26,15 +35,20 @@ struct GridDataSource {
 // WiNet-S, not the DTSU666-20 meter, is polled directly).
 extern const GridDataSource GRID_SOURCE_SUNGROW_WINET;
 
-// Fixed-value simulated sources - not real meter integrations. One reports
-// a fixed export figure, the other a fixed import figure, so both the
-// surplus and deficit control-loop paths can be exercised without real
-// solar. Each lives in its own file, one source per file like
-// grid_source_sungrow_winet.cpp, so either can double as a minimal
-// reference when adding a real second source later. See
-// grid_source_simulated_export.cpp / grid_source_simulated_import.cpp.
-extern const GridDataSource GRID_SOURCE_SIMULATED_EXPORT;
-extern const GridDataSource GRID_SOURCE_SIMULATED_IMPORT;
+// Reactive simulated sources - not real meter integrations, but each models
+// a fixed PV capacity and house load, then subtracts currentDrawW each poll,
+// so reported export genuinely shrinks as target amps rises (unlike a
+// constant-value fixed source, which never accounts for the EV's own draw
+// and so never converges - see CLAUDE.md "Resolved", 2026-09-03). One file
+// per source, spanning no sun through more sun than MAX_CURRENT_A can use:
+// grid_source_simulated_reactive_no_sun.cpp (0W PV - always a deficit,
+// never charges), _low.cpp (just under the 6A floor's wattage requirement),
+// _moderate.cpp (comfortably charging, mid-range), _high.cpp (exceeds
+// MAX_CURRENT_A - exercises the ceiling clamp).
+extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_NO_SUN;
+extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_LOW;
+extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_MODERATE;
+extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_HIGH;
 
 // All sources compiled into this build, selectable at runtime from the HTTP
 // control page (see solar_control.cpp) instead of a compile-time #define.
