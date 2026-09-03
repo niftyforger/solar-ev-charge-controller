@@ -376,10 +376,9 @@ select{width:100%}
   <div id="dashboard" style="display:none">
     <div class="grid">
       <section class="card">
-        <h2>Target current</h2>
-        <div class="stat-value"><span id="targetAmps">-- A</span> <span class="stat-value-sub" id="targetWatts">(-- W)</span></div>
+        <h2>Target power</h2>
+        <div class="stat-value"><span id="targetWatts">-- W</span> <span class="stat-value-sub" id="targetAmps">(-- A)</span></div>
         <div class="stat-sub" id="decision">Loading&hellip;</div>
-        <div class="flow-row"><span class="flow-dot" id="gridFlow"></span><span id="gridWatts">-- W</span></div>
       </section>
 
       <section class="card">
@@ -395,6 +394,7 @@ select{width:100%}
           <select id="sourceSelect"></select>
           <div class="stat-sub" id="pollFailedNote" style="display:none;color:var(--bad)">Last poll failed</div>
         </div>
+        <div class="kv"><span>Power</span><span><span class="flow-dot" id="gridFlow" style="display:inline-block;vertical-align:middle;margin-right:6px"></span><span id="gridWatts">--</span></span></div>
         <div class="kv"><span>Voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
@@ -457,8 +457,8 @@ select{width:100%}
   }
 
   function render(d){
-    $('targetAmps').textContent = d.target_a.toFixed(1) + ' A';
-    $('targetWatts').textContent = '(' + Math.round(d.target_w) + ' W)';
+    $('targetWatts').textContent = Math.round(d.target_w) + ' W';
+    $('targetAmps').textContent = '(' + d.target_a.toFixed(1) + ' A)';
     $('decision').textContent = d.decision + (d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
     $('gridWatts').textContent = Math.abs(d.grid_w).toFixed(0) + ' W ' + (d.exporting ? 'exporting' : 'importing');
     $('gridFlow').className = 'flow-dot ' + (d.exporting ? 'flow-export' : 'flow-import');
