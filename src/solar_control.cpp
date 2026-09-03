@@ -47,10 +47,35 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
     }
 
     float surplusW = -gridPowerW; // positive = exporting
-    float deltaA = surplusW / mainsVoltageV;
-    deltaA = constrain(deltaA, -STEP_MAX_A_PER_POLL, STEP_MAX_A_PER_POLL);
 
-    float newTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
+    // Full correction from the current surplus reading, no per-step
+    // magnitude limit - nothing in the CP protocol requires gradual current
+    // changes. SETTLE_MS (checked above) is what gates reaction rate, giving
+    // the EV's own draw (part of what gridPowerW measures) time to show up
+    // in the next reading before this runs again - this loop is still
+    // self-correcting, just not rate-limited in magnitude on top of that.
+    // rawTargetA is the *exact* amps the current surplus reading supports
+    // (including from a cold start - a large surplus jumps straight to its
+    // true equilibrium in one settled poll, not to the floor first and the
+    // rest a poll later).
+    float deltaA = surplusW / mainsVoltageV;
+    float rawTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
+
+    // Floor/hysteresis snapping mirrors cp_interceptor.cpp's own
+    // STANDBY/OSCILLATING thresholds: bare MIN_CURRENT_A floor on entry (no
+    // margin - 10% duty is itself a fully valid signal), HYSTERESIS_A margin
+    // only on exit (so noise sitting right at the floor can't flap it).
+    bool wasCharging = currentTargetA >= MIN_CURRENT_A;
+    float floorThreshold = wasCharging ? (MIN_CURRENT_A - HYSTERESIS_A) : MIN_CURRENT_A;
+
+    float newTargetA;
+    if (rawTargetA < floorThreshold) {
+        newTargetA = 0.0f; // not enough surplus (or a real deficit) - don't charge / drop out
+    } else if (rawTargetA < MIN_CURRENT_A) {
+        newTargetA = MIN_CURRENT_A; // exit-hysteresis band; duty floor holds actual output at 6A anyway
+    } else {
+        newTargetA = rawTargetA;
+    }
 
     ControlDecision decision;
     if (newTargetA > currentTargetA) {
@@ -121,30 +146,13 @@ static void save_grid_source_to_nvs(const char *id) {
     prefs.end();
 }
 
-// --- Mains voltage: runtime-configurable from the control page ------------
-// Same ownership/no-mutex reasoning as s_active_grid_source above. Not every
-// install is 240V, so this is adjustable rather than the config.h constant
-// it used to be - see MAINS_VOLTAGE_DEFAULT_V.
-static float s_mains_voltage_v = MAINS_VOLTAGE_DEFAULT_V;
-
-static const char *MAINS_VOLTAGE_NVS_NAMESPACE = "pwrcfg";
-
-// Independent of "gridsrc" and BLE's "netcfg" namespaces - its own small
-// HTTP-control-page-managed setting, not a BLE-provisioned one.
-static void load_mains_voltage_from_nvs() {
-    Preferences prefs;
-    prefs.begin(MAINS_VOLTAGE_NVS_NAMESPACE, true);
-    s_mains_voltage_v = prefs.getFloat("voltage", MAINS_VOLTAGE_DEFAULT_V);
-    prefs.end();
-    s_mains_voltage_v = constrain(s_mains_voltage_v, MAINS_VOLTAGE_MIN_V, MAINS_VOLTAGE_MAX_V);
-}
-
-static void save_mains_voltage_to_nvs(float voltageV) {
-    Preferences prefs;
-    prefs.begin(MAINS_VOLTAGE_NVS_NAMESPACE, false);
-    prefs.putFloat("voltage", voltageV);
-    prefs.end();
-}
+// Grid voltage is no longer a manually-configured global setting - it comes
+// from the active GridDataSource itself each poll (see grid_data_source.h's
+// GridDataSourceReadFn and CLAUDE.md "Solar data source"). This is a status
+// cache only (same pattern as s_last_target_amps below), not a config value,
+// so handle_root()/build_status_json() can show the most recently reported
+// figure between polls.
+static float s_last_mains_voltage_v = MAINS_VOLTAGE_FIXED_V;
 
 // Latest status, cached here purely for the web UI so handle_root() can
 // render the same picture the control loop just acted on rather than
@@ -314,6 +322,7 @@ select{width:100%}
       <section class="card">
         <h2>Link health</h2>
         <div class="kv"><span>Data source</span><span id="sourceName">--</span></div>
+        <div class="kv"><span>Voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
           Data is stale &mdash; CP will fail safe to native pass-through.
@@ -325,13 +334,6 @@ select{width:100%}
         <div class="field">
           <label for="sourceSelect">Grid source</label>
           <select id="sourceSelect"></select>
-        </div>
-        <div class="field">
-          <label for="voltageInput">Mains voltage (V)</label>
-          <span class="watts-input-group">
-            <input type="number" id="voltageInput" step="1">
-            <button id="voltageApply" type="button">Apply</button>
-          </span>
         </div>
       </section>
     </div>
@@ -366,9 +368,7 @@ select{width:100%}
       }).join('');
     }
 
-    if (document.activeElement !== $('voltageInput')) {
-      $('voltageInput').value = d.voltage_v;
-    }
+    $('voltageDisplay').textContent = d.voltage_v.toFixed(0) + ' V';
   }
 
   function showError(msg){
@@ -395,9 +395,6 @@ select{width:100%}
   document.addEventListener('DOMContentLoaded', function(){
     $('sourceSelect').addEventListener('change', function(){
       applyAndRender('/api/set_source?id=' + encodeURIComponent(this.value));
-    });
-    $('voltageApply').addEventListener('click', function(){
-      applyAndRender('/api/set_voltage?v=' + encodeURIComponent($('voltageInput').value));
     });
     poll();
     setInterval(poll, 5000);
@@ -508,7 +505,7 @@ static const char *build_status_json() {
         surplusW >= 0 ? "true" : "false",
         (unsigned long)settleRemainingS,
         s_last_target_amps,
-        s_last_target_amps * s_mains_voltage_v,
+        s_last_target_amps * s_last_mains_voltage_v,
         cpModeLabel, cpModeStr, cpModeCls,
         cpDutyLabel, cpDutyStr, cpDutyCls,
         connector_state_label(cp.connector_state), connector_state_str(cp.connector_state),
@@ -518,7 +515,7 @@ static const char *build_status_json() {
         !s_last_solar_status.modbus_ok ? "true" : "false",
         pollAgeStr,
         stale ? "true" : "false",
-        s_mains_voltage_v);
+        s_last_mains_voltage_v);
 
     offset = append_sources_json(s_json_body, sizeof(s_json_body), offset);
     if (offset < sizeof(s_json_body)) {
@@ -530,19 +527,6 @@ static const char *build_status_json() {
 static void handle_api_status() {
     if (!require_auth()) {
         return;
-    }
-    s_web_server.send(200, "application/json", build_status_json());
-}
-
-static void handle_api_set_voltage() {
-    if (!require_auth()) {
-        return;
-    }
-    if (s_web_server.hasArg("v")) {
-        float voltage = s_web_server.arg("v").toFloat();
-        voltage = constrain(voltage, MAINS_VOLTAGE_MIN_V, MAINS_VOLTAGE_MAX_V);
-        s_mains_voltage_v = voltage;
-        save_mains_voltage_to_nvs(voltage);
     }
     s_web_server.send(200, "application/json", build_status_json());
 }
@@ -577,7 +561,6 @@ static void register_network_services() {
     s_web_server.on("/", HTTP_GET, handle_root);
     s_web_server.on("/api/status", HTTP_GET, handle_api_status);
     s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
-    s_web_server.on("/api/set_voltage", HTTP_GET, handle_api_set_voltage);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
@@ -604,7 +587,6 @@ void solar_control_task(void *pvParameters) {
     RuntimeConfig cfg = shared_state_get_runtime_config();
     uint32_t lastAppliedGeneration = cfg.generation;
     load_grid_source_from_nvs();
-    load_mains_voltage_from_nvs();
 
     connect_wifi(cfg);
     register_network_services();
@@ -682,14 +664,22 @@ void solar_control_task(void *pvParameters) {
 
             if (status.wifi_connected) {
                 float gridPowerW;
-                if (s_active_grid_source->read_power_w(inverterIp, gridPowerW)) {
+                float voltageV;
+                // currentDrawW is derived from the previous poll's voltage -
+                // this poll's own voltage isn't known until the read call
+                // below returns it. Negligible staleness, consistent with
+                // the rest of this loop's one-poll-delayed self-referential
+                // design.
+                float currentDrawW = targetAmps * s_last_mains_voltage_v;
+                if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV)) {
                     status.modbus_ok = true;
                     status.grid_power_w = gridPowerW;
                     lastPollSuccessMs = millis();
                     status.last_poll_success_ms = lastPollSuccessMs;
 
-                    s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, s_mains_voltage_v);
+                    s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, voltageV);
                     shared_state_set_target_amps(targetAmps);
+                    s_last_mains_voltage_v = voltageV;
                 }
             }
 

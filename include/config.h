@@ -44,18 +44,14 @@
 #define MIN_CURRENT_A            6.0f
 #define MAX_CURRENT_A            32.0f
 
-// Mains voltage is runtime-configurable from the HTTP control page (not
-// every install is 240V) and persisted to NVS - see solar_control.cpp's
-// s_mains_voltage_v / load_mains_voltage_from_nvs(). MAINS_VOLTAGE_DEFAULT_V
-// is only the fallback used before any value has ever been persisted.
-// MIN/MAX are input-sanity clamp bounds for /api/set_voltage - prevent a
-// near-zero or absurd value from blowing up compute_next_target_amps()'s
-// division. Placeholder bounds, wide enough to cover single-phase mains
-// worldwide (100V-240V) with margin - narrow if a tighter sanity check is
-// ever wanted.
-#define MAINS_VOLTAGE_DEFAULT_V  240.0f
-#define MAINS_VOLTAGE_MIN_V      100.0f
-#define MAINS_VOLTAGE_MAX_V      300.0f
+// Grid voltage is per-GridDataSource, not a manually-configured global
+// setting (see grid_data_source.h's GridDataSourceReadFn) - GRID_SOURCE_SUNGROW_WINET
+// reads the real value from the inverter, every simulated/reactive source
+// reports this fixed value instead (not every real install is 240V, but a
+// simulated source has no real grid to read from). Also used as
+// grid_source_sungrow_winet.cpp's fallback before its first successful
+// voltage register read.
+#define MAINS_VOLTAGE_FIXED_V    240.0f
 
 // Native PWM sanity window (~1kHz nominal, generous guard band against glitches)
 #define NATIVE_PERIOD_MIN_US     800.0
@@ -160,7 +156,6 @@
 // ---------------------------------------------------------------------------
 #define POLL_INTERVAL_MS          5000UL
 #define STALE_DATA_TIMEOUT_MS     60000UL
-#define STEP_MAX_A_PER_POLL       2.0f
 #define SETTLE_MS                 15000UL
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
 #define WIFI_HOSTNAME              "solar-ev-charger"
