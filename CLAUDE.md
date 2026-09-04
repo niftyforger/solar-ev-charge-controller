@@ -130,16 +130,10 @@ All four stages complete and passed clean.
 
 ## Open questions for implementation
 
-Still genuinely unresolved (design-philosophy call, not firmware-settleable):
+All previously open items are now resolved.
 
-- Whether the shared-ground/signal-only-isolation design (see "CP interception circuit" above) is acceptable long-term, or a fully galvanically-isolated PE-side supply is worth adding later.
-
-Have an implemented default, still unconfirmed:
-
-- Battery-power register (`13021`) exact scale — ran ~10% below the Sungrow app's figure during one cloudy correlation window; plausibly just window skew, worth rechecking under steadier conditions.
-
-Resolved, kept here for the record:
-
+- Shared-ground/signal-only isolation (see "CP interception circuit" above) — **kept as final, 2026-09-04**, not a galvanically-isolated PE-side supply. Not worth the added cost/complexity given the existing protection (high-Z `R5` divider + `D3`/`D4` clamp diodes).
+- Battery-power register (`13021`) exact scale — **closed out, 2026-09-04**. The ~10% discrepancy against the Sungrow app is attributed to correlation-window skew on a cloudy/fluctuating sampling day, not a real register/scale error.
 - BLE range/reliability inside the metal EVSE enclosure — confirmed adequate, no external antenna needed.
 - Resistor divider/comparator thresholds — confirmed against the real EVSE in stage 2; 1% tolerance on `R5`/`R6`/`R8` is sufficient.
 - GPIO pin assignments — physically wired and confirmed correct in stages 0-2.
