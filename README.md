@@ -139,6 +139,21 @@ Once WiFi is up, subsequent flashes can go over OTA (`ArduinoOTA`, password-prot
 
 Bench-tested through all stages, including the real EVSE and a real vehicle (2026-09-04): BLE provisioning, comparator thresholds, disconnect-relay open/close, and live mid-charge duty-cycle changes all confirmed clean, no state-B blip needed. Remaining open item is a design-philosophy call, not a bring-up gap — see [CLAUDE.md § Open questions](CLAUDE.md#open-questions-for-implementation).
 
+## Gallery
+
+Control page:
+
+| | |
+|---|---|
+| <img src="img/control_page_1.png" width="600" alt="Control page 1"> | <img src="img/control_page_2.png" width="600" alt="Control page 2"> |
+
+Bench setup:
+
+| | |
+|---|---|
+| <img src="img/lab_1.jpg" width="600" alt="Bench setup 1"> | <img src="img/lab_2.jpg" width="600" alt="Bench setup 2"> |
+| <img src="img/lab_3.jpg" width="600" alt="Bench setup 3"> | <img src="img/lab_4.jpg" width="600" alt="Bench setup 4"> |
+
 ## Author
 
 [coder@niftyforger.com](mailto:coder@niftyforger.com)
