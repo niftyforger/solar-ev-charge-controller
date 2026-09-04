@@ -20,7 +20,7 @@ flowchart LR
 
     subgraph esp["ESP32-S3"]
         direction TB
-        core0["Core 0\nWiFi + Modbus poll\nstep-limited control law\nBLE config · OTA · sim web page"]
+        core0["Core 0\nWiFi + Modbus poll\nsettling control law\nBLE config · OTA · control page"]
         bridge[["shared_state\nqueue + mutex"]]
         core1["Core 1\nGPIO edge ISR + HW timer\n-> RMT clamp waveform"]
         core0 -- "target amps" --> bridge --> core1
@@ -53,6 +53,7 @@ Key properties baked into the topology, not just firmware:
 - The clamp can only **shunt `CP_LINE` toward `GND`** — it has no way to source voltage, so it can clip current down but can never raise it above what the EVSE natively offers, regardless of what firmware does.
 - The relay only ever **removes the vehicle's CP termination**, never alters the waveform — with it open, the EVSE sees the same thing it would see on a real unplug (state A) and stops offering charge using its own normal handling, not a signal this project invents.
 - Isolation is **signal-only**: the sense/clamp/relay lines that cross into/out of Core 1 each go through their own optocoupler, but the sense/clamp/relay circuitry itself shares a ground with the ESP32 side (no separate PE-referenced supply). See [CP interceptor circuit](#cp-interceptor-circuit) below.
+- **Home-battery discharge doesn't count as surplus.** The meter sits downstream of the home battery, so it can't tell fresh PV export apart from battery-discharge export on its own — Core 0 reads the inverter's battery-power register separately and subtracts any discharge back out before computing how much current the surplus can support, so the loop never diverts battery power into EV charging.
 
 See [Safety model](#safety-model) below for the full fail-safe contract.
 
@@ -95,7 +96,7 @@ Freenove ESP32-S3-WROOM on its breakout board. Dual-core split:
 
 | Core | Role |
 |---|---|
-| Core 0 | WiFi, Modbus TCP polling of the inverter, control law, BLE config server, OTA, sim-mode web page |
+| Core 0 | WiFi, Modbus TCP polling of the inverter, control law, BLE config server, OTA, control page |
 | Core 1 (pinned, high priority) | GPIO edge-triggered ISR + hardware timer + RMT — asserts/releases the CP clamp with sub-task-switch latency |
 
 Pin assignments live in [`include/config.h`](include/config.h) (see CLAUDE.md for the full table and rationale) — physically confirmed on the bench.
@@ -105,7 +106,7 @@ Pin assignments live in [`include/config.h`](include/config.h) (see CLAUDE.md fo
 | File | Responsibility |
 |---|---|
 | [`src/main.cpp`](src/main.cpp) | Task/core setup |
-| [`src/solar_control.*`](src/solar_control.cpp) | Core 0: WiFi, poll loop, step-limited/settling control law, OTA, sim-mode page |
+| [`src/solar_control.*`](src/solar_control.cpp) | Core 0: WiFi, poll loop, settling control law, OTA, control page |
 | [`src/modbus_tcp_client.*`](src/modbus_tcp_client.cpp) | Minimal hand-rolled Modbus TCP client for the WiNet-S |
 | [`src/cp_interceptor.*`](src/cp_interceptor.cpp) | Core 1: edge capture, RMT clamp waveform, `BYPASS`/`ACTIVE` × `OSCILLATING`/`STANDBY` state machine, watchdog |
 | [`src/shared_state.*`](src/shared_state.cpp) | Core0↔Core1 bridge (queue + mutex, zero-timeout on Core 1's side); also holds the BLE-provisioned WiFi/inverter-IP `RuntimeConfig` |
@@ -127,7 +128,7 @@ pio run -t upload      # flash over USB
 
 BLE advertises **indefinitely** until the device has been provisioned at least once, so a freshly-flashed board is always reachable — after that first `COMMIT`, it only advertises for `BLE_ADVERTISE_WINDOW_MS` (5 minutes, [`include/config.h`](include/config.h)) after each boot, closing the window for the rest of that session. To reconfigure a device that's already provisioned, power-cycle it and connect within that 5-minute window.
 
-Once WiFi is up, subsequent flashes can go over OTA (`ArduinoOTA`, password-protected by `OTA_PASSWORD`) instead of pulling the board for USB access. Run it with `python tools/ota_upload.py` (loads `.env`'s `UPLOAD_PORT`/`OTA_PASSWORD` for that one invocation), or run `python tools/sync_env_vars.py` once and restart VSCode to make the PlatformIO IDE's own "Upload" button work directly with the `ota` environment selected — see the `[env:ota]` comment in [`platformio.ini`](platformio.ini) for why `.env` can't be wired in more automatically than that. A sim-mode web page at `http://<device-ip>/` (HTTP Basic Auth, username `admin`, password set over BLE via `SET WEB_PASS` — refuses all requests until one has been set) lets you drive the control loop with a fake export figure for bench/night-time testing without real solar.
+Once WiFi is up, subsequent flashes can go over OTA (`ArduinoOTA`, password-protected by `OTA_PASSWORD`) instead of pulling the board for USB access. Run it with `python tools/ota_upload.py` (loads `.env`'s `UPLOAD_PORT`/`OTA_PASSWORD` for that one invocation), or run `python tools/sync_env_vars.py` once and restart VSCode to make the PlatformIO IDE's own "Upload" button work directly with the `ota` environment selected — see the `[env:ota]` comment in [`platformio.ini`](platformio.ini) for why `.env` can't be wired in more automatically than that. The control page at `http://<device-ip>/` (HTTP Basic Auth, username `admin`, password set over BLE via `SET WEB_PASS` — refuses all requests until one has been set) is the same page used for live operation, with a grid-source dropdown to switch between the real inverter and a family of reactive simulated scenarios (no sun / low / moderate / high / battery-discharge) — the latter exercise the full poll/control-law/target-amps path for bench and night-time testing without real solar.
 
 ## Safety model
 
