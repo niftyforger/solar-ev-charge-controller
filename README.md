@@ -154,6 +154,12 @@ Bench setup:
 | <img src="img/lab_1.jpg" width="600" alt="Bench setup 1"> | <img src="img/lab_2.jpg" width="600" alt="Bench setup 2"> |
 | <img src="img/lab_3.jpg" width="600" alt="Bench setup 3"> | <img src="img/lab_4.jpg" width="600" alt="Bench setup 4"> |
 
+EVSE enclosure:
+
+| | |
+|---|---|
+| <img src="img/EVSE_1.jpg" width="600" alt="Control board installed inside the EVSE enclosure"> | <img src="img/EVSE_2.jpg" width="600" alt="Control board installed inside the EVSE enclosure"> |
+
 ## Author
 
 [coder@niftyforger.com](mailto:coder@niftyforger.com)
