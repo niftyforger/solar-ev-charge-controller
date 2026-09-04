@@ -365,7 +365,7 @@ select{width:100%}
         </div>
         <div class="kv"><span>Power</span><span><span class="flow-dot" id="gridFlow" style="display:inline-block;vertical-align:middle;margin-right:6px"></span><span id="gridWatts">--</span></span></div>
         <div class="kv"><span>Battery</span><span id="batteryWatts">--</span></div>
-        <div class="kv"><span>Voltage</span><span id="voltageDisplay">--</span></div>
+        <div class="kv"><span>Grid voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="batteryExcludedNote" class="stat-sub" style="display:none"></div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
