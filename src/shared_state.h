@@ -8,12 +8,10 @@ enum SystemMode {
 };
 
 enum CpDutyState {
-    // While MODE_ACTIVE: surplus is genuinely below the 6A floor (with
-    // hysteresis) - the CP disconnect relay is driven open, isolating the
-    // vehicle's CP termination so the EVSE reads "unplugged" and stops
-    // charging on its own. While MODE_BYPASS: just internal bookkeeping: the
-    // relay stays closed regardless (see cp_interceptor_task()) - a fault
-    // must never trigger a disconnect.
+    // Under MODE_ACTIVE: surplus is below the 6A floor (with hysteresis) - the disconnect
+    // relay opens, isolating the vehicle's CP termination so the EVSE reads "unplugged".
+    // Under MODE_BYPASS: just bookkeeping - the relay stays closed regardless, since a
+    // fault must never trigger a disconnect (see cp_interceptor_task()).
     CP_STANDBY = 0,
     CP_OSCILLATING = 1, // relay closed, clamp active per current surplus
 };
@@ -31,18 +29,12 @@ struct SolarStatus {
     uint32_t last_poll_success_ms;
     bool wifi_connected;
     bool modbus_ok;
-    // Independent liveness path for scheduled (fixed-current) charging - see
-    // CLAUDE.md "Solar data source" and cp_interceptor_task()'s staleness
-    // check. schedule_active is whether solar_control_task's most recent
-    // loop tick found an enabled schedule whose UTC window covers "now";
-    // last_schedule_confirm_ms only advances while that's true (carried
-    // forward otherwise), so it ages past STALE_DATA_TIMEOUT_MS on its own
-    // once the window ends or NTP/WiFi/Core 0 stops confirming it - no
-    // separate timeout constant or transition-handling code needed. This
-    // lets MODE_ACTIVE stay reachable purely from a fresh schedule
-    // confirmation even while last_poll_success_ms is stale (e.g. the
-    // inverter/Modbus link is down), which is the whole point: a fixed-
-    // current schedule must not depend on the solar grid-data pipeline.
+    // Independent liveness path for scheduled (fixed-current) charging - schedule_active
+    // is whether the most recent loop tick found an enabled schedule whose UTC window
+    // covers "now"; last_schedule_confirm_ms only advances while that's true, so it ages
+    // past STALE_DATA_TIMEOUT_MS on its own once the window ends. Lets MODE_ACTIVE stay
+    // reachable from a fresh schedule confirmation even while the grid-data poll is stale -
+    // a fixed-current schedule must not depend on the solar pipeline.
     bool schedule_active;
     uint32_t last_schedule_confirm_ms;
 };
@@ -61,10 +53,8 @@ struct RuntimeConfig {
     char inverter_ip[16];
     bool provisioned;
     uint32_t generation;
-    // BLE-config gate and HTTP control-page passwords - each independent of
-    // OTA_PASSWORD and of each other, empty string meaning "never set" (same
-    // convention as ssid/provisioned above). See CLAUDE.md "BLE
-    // configuration".
+    // BLE-config gate and HTTP control-page passwords - independent of OTA_PASSWORD and of
+    // each other, empty string meaning "never set" (see CLAUDE.md "BLE configuration").
     char ble_password[64];
     char web_password[64];
 };
@@ -92,30 +82,20 @@ bool shared_state_try_publish_cp_status(const CpStatus &s); // non-blocking
 CpStatus shared_state_get_cp_status_blocking();
 
 // --- Core 0 -> Core 1: solar_control_task liveness heartbeat -------------
-// A plain volatile word (millis() timestamp), not mutex-protected: a 32-bit
-// aligned read/write is already atomic on this platform, and this is a
-// liveness signal, not data that needs a consistent multi-field snapshot -
-// the same pattern cp_interceptor.cpp already uses for its Core0/Core1
-// mode/duty-state volatiles. Core 0 calls the setter once per loop
-// iteration; Core 1 polls the getter on its own cadence (see
-// SOLAR_TASK_HEARTBEAT_TIMEOUT_MS in config.h) to detect a wedged Core 0
-// (WiFi/lwIP/WebServer hang) and recover via esp_restart() - see
-// cp_interceptor_task().
+// A plain volatile word (millis() timestamp), not mutex-protected - a 32-bit aligned
+// read/write is already atomic here, same pattern as cp_interceptor.cpp's mode/duty-state
+// volatiles. Core 0 sets it once per loop; Core 1 polls it (SOLAR_TASK_HEARTBEAT_TIMEOUT_MS)
+// to detect a wedged Core 0 and recover via esp_restart().
 void shared_state_heartbeat_solar_task();
 uint32_t shared_state_solar_task_heartbeat_age_ms();
 
 // --- BLE (ble_config.cpp) -> Core 0: WiFi + inverter runtime config ------
-// WiFi SSID/password, the inverter IP, and the BLE/web-page passwords are
-// all provisioned entirely over BLE and have no compile-time fallback - see
-// CLAUDE.md "BLE configuration". All setters copy into fixed-size buffers
-// (bounded, always null-terminated) so callers don't need to match
-// RuntimeConfig's exact field sizes.
+// Provisioned entirely over BLE, no compile-time fallback (see CLAUDE.md "BLE
+// configuration"). Setters copy into fixed-size buffers (bounded, null-terminated).
 //
-// `generation` increments only on shared_state_set_wifi_config() -
-// solar_control_task compares it once per loop iteration and only
-// reconnects WiFi / re-parses the inverter IP when it changes. The two
-// password setters deliberately do NOT touch `generation`: a BLE- or
-// web-page-password change is not a reason for Core 0 to bounce WiFi.
+// `generation` increments only on shared_state_set_wifi_config() - solar_control_task
+// reconnects WiFi / re-parses the inverter IP only when it changes. The password setters
+// deliberately don't touch it, since a password change is not a reason to bounce WiFi.
 void shared_state_init_runtime_config(const RuntimeConfig &initial);
 void shared_state_set_wifi_config(const char *ssid, const char *password,
                                    const char *inverter_ip);

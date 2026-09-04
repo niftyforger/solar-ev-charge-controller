@@ -35,11 +35,9 @@ static const char *decision_reason_str(ControlDecision d) {
     }
 }
 
-// Step-limited, settling-gated integration from surplus power to target
-// current. The EV's own draw is part of what the meter measures, so we
-// deliberately do not chase every single reading: each accepted change
-// starts a settle window, and readings during that window are ignored by
-// the control law (still displayed/logged, just not acted on) so the loop
+// Settling-gated integration from surplus power to target current. The EV's own draw is
+// part of what the meter measures, so each accepted change starts a settle window and
+// readings during it are ignored (still displayed/logged, not acted on) so the loop
 // doesn't fight its own effect on the next poll.
 static ControlDecision compute_next_target_amps(float currentTargetA, float gridPowerW,
                                                   uint32_t nowMs, uint32_t &lastChangeMs,
@@ -51,23 +49,15 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
 
     float surplusW = -gridPowerW; // positive = exporting
 
-    // Full correction from the current surplus reading, no per-step
-    // magnitude limit - nothing in the CP protocol requires gradual current
-    // changes. SETTLE_MS (checked above) is what gates reaction rate, giving
-    // the EV's own draw (part of what gridPowerW measures) time to show up
-    // in the next reading before this runs again - this loop is still
-    // self-correcting, just not rate-limited in magnitude on top of that.
-    // rawTargetA is the *exact* amps the current surplus reading supports
-    // (including from a cold start - a large surplus jumps straight to its
-    // true equilibrium in one settled poll, not to the floor first and the
-    // rest a poll later).
+    // Full correction from the current surplus reading, no per-step magnitude limit -
+    // nothing in the CP protocol requires gradual changes. SETTLE_MS alone gates reaction
+    // rate. rawTargetA is the exact amps the current surplus supports, even from a cold
+    // start - a large surplus reaches equilibrium in one settled poll, not the floor first.
     float deltaA = surplusW / mainsVoltageV;
     float rawTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
 
-    // Floor/hysteresis snapping mirrors cp_interceptor.cpp's own
-    // STANDBY/OSCILLATING thresholds: bare MIN_CURRENT_A floor on entry (no
-    // margin - 10% duty is itself a fully valid signal), HYSTERESIS_A margin
-    // only on exit (so noise sitting right at the floor can't flap it).
+    // Mirrors cp_interceptor.cpp's own STANDBY/OSCILLATING thresholds: bare
+    // MIN_CURRENT_A floor on entry (no margin), HYSTERESIS_A margin only on exit.
     bool wasCharging = currentTargetA >= MIN_CURRENT_A;
     float floorThreshold = wasCharging ? (MIN_CURRENT_A - HYSTERESIS_A) : MIN_CURRENT_A;
 
@@ -100,14 +90,10 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
     return decision;
 }
 
-// WiFi SSID/password have no compile-time fallback - they're provisioned
-// entirely over BLE (see ble_config.cpp) and read here out of shared_state.
-// If the device hasn't been provisioned yet (or the SSID is empty), this
-// deliberately does not call WiFi.begin() at all - retried on the normal
-// WIFI_RECONNECT_INTERVAL_MS cadence until the RuntimeConfig indicates a
-// real SSID exists. Core 1's existing stale-data fail-safe (MODE_BYPASS)
-// already makes "no working network" safe: native CP pass-through, never a
-// guessed setpoint or a disconnect - see CLAUDE.md.
+// WiFi SSID/password are provisioned entirely over BLE (ble_config.cpp), read here from
+// shared_state. Skips WiFi.begin() entirely if unprovisioned/empty - retried on the normal
+// WIFI_RECONNECT_INTERVAL_MS cadence. Core 1's stale-data fail-safe already makes "no
+// working network" safe (native pass-through).
 static void connect_wifi(const RuntimeConfig &cfg) {
     if (!cfg.provisioned || cfg.ssid[0] == '\0') {
         return;
@@ -118,18 +104,14 @@ static void connect_wifi(const RuntimeConfig &cfg) {
 }
 
 // --- Grid data source: runtime-selectable from the control page -----------
-// Same ownership as the sim-mode statics above: only Core 0's solar_control_
-// task ever reads or writes this (poll loop + its synchronous WebServer
-// handlers), so no mutex is needed. Always a valid pointer - either this
-// compile-time default or whatever grid_data_source_lookup() returns, which
-// itself never returns null (falls back to index 0) - so no call site needs
-// a null check.
+// Only Core 0's solar_control_task ever touches this (poll loop + its synchronous
+// WebServer handlers), so no mutex needed. Always valid - grid_data_source_lookup()
+// never returns null (falls back to index 0), so no call site needs a null check.
 static const GridDataSource *s_active_grid_source = &GRID_SOURCE_SUNGROW_WINET;
 
 static const char *GRID_SOURCE_NVS_NAMESPACE = "gridsrc";
 
-// Independent of ble_config.cpp's "netcfg" namespace - this isn't a
-// BLE-provisioned setting, it's chosen from the HTTP control page.
+// Independent of ble_config.cpp's "netcfg" namespace - chosen from the HTTP control page.
 static void load_grid_source_from_nvs() {
     Preferences prefs;
     prefs.begin(GRID_SOURCE_NVS_NAMESPACE, true);
@@ -138,8 +120,7 @@ static void load_grid_source_from_nvs() {
     if (id.length() > 0) {
         s_active_grid_source = &grid_data_source_lookup(id.c_str());
     }
-    // else: nothing saved yet (first boot / fresh NVS) - keep the
-    // compile-time default, preserving today's real-hardware behavior.
+    // else: nothing saved yet - keep the compile-time default.
 }
 
 static void save_grid_source_to_nvs(const char *id) {
@@ -150,15 +131,11 @@ static void save_grid_source_to_nvs(const char *id) {
 }
 
 // --- Scheduled (fixed-current) charging ------------------------------------
-// A control-page-owned setting, same ownership/mutex-free reasoning as
-// s_active_grid_source above (only Core 0's own task + its synchronous
-// WebServer handlers ever touch it) and its own NVS namespace, independent
-// of both ble_config.cpp's "netcfg" and GRID_SOURCE_NVS_NAMESPACE - see
-// CLAUDE.md "Solar data source" / config.h's scheduled-charging section.
+// Control-page-owned, same ownership/mutex-free reasoning as s_active_grid_source above,
+// own NVS namespace independent of "netcfg"/GRID_SOURCE_NVS_NAMESPACE.
 //
-// start_min/end_min are UTC minutes-since-midnight. Storing/evaluating in
-// UTC keeps all timezone/DST conversion in the browser (see PAGE_HTML's JS)
-// rather than needing a TZ rule on-device.
+// start_min/end_min are UTC minutes-since-midnight - storing/evaluating in UTC keeps
+// timezone/DST conversion in the browser (PAGE_HTML's JS), no TZ rule needed on-device.
 struct ScheduleConfig {
     bool enabled;
     uint16_t start_min;
@@ -216,19 +193,14 @@ static bool is_schedule_window_now(const ScheduleConfig &s, const struct tm &utc
     return nowMin >= s.start_min || nowMin < s.end_min;
 }
 
-// Grid voltage is no longer a manually-configured global setting - it comes
-// from the active GridDataSource itself each poll (see grid_data_source.h's
-// GridDataSourceReadFn and CLAUDE.md "Solar data source"). This is a status
-// cache only (same pattern as s_last_target_amps below), not a config value,
-// so handle_root()/build_status_json() can show the most recently reported
-// figure between polls.
+// Grid voltage comes from the active GridDataSource each poll, not a manually-configured
+// global. This is a status cache only (like s_last_target_amps below), so
+// handle_root()/build_status_json() can show the most recently reported figure between polls.
 static float s_last_mains_voltage_v = MAINS_VOLTAGE_FIXED_V;
 
-// Latest status, cached here purely for the web UI so handle_root() can
-// render the same picture the control loop just acted on rather than
-// re-deriving it. Written once per poll from solar_control_task's own loop,
-// read once per page request from the same task via handleClient() - no
-// cross-task access, so no mutex needed for these either.
+// Latest status, cached for the web UI. Written once per poll from solar_control_task's own
+// loop, read once per page request from the same task via handleClient() - no cross-task
+// access, so no mutex needed.
 static SolarStatus s_last_solar_status = {};
 static float s_last_target_amps = 0.0f;
 static ControlDecision s_last_decision = DECISION_HOLD;
@@ -236,12 +208,9 @@ static uint32_t s_last_lastChangeMs = 0;
 
 static WebServer s_web_server(SIM_HTTP_PORT);
 
-// web_password is set entirely over BLE (SET WEB_PASS command, see
-// ble_config.cpp) and has no compile-time fallback - OTA_PASSWORD is used
-// only for OTA flashing (see register_network_services() below), never for
-// this page. Until a web password has been committed at least once, the
-// page refuses every request outright rather than falling back to an
-// empty/guessable credential.
+// web_password is set entirely over BLE (SET WEB_PASS, ble_config.cpp) - never
+// OTA_PASSWORD. Until one has been committed, the page refuses every request outright
+// rather than falling back to an empty/guessable credential.
 static bool require_auth() {
     RuntimeConfig cfg = shared_state_get_runtime_config();
     if (cfg.web_password[0] == '\0') {
@@ -550,13 +519,10 @@ static void handle_root() {
 }
 
 // --- JSON status API ---------------------------------------------------
-// Kept file-scope (rather than a stack local) so a deeply nested call chain
-// (WiFi/OTA/WebServer internals all run inside this same task) never has to
-// find room for it on the stack. Much smaller than the old full-HTML buffer
-// since the static shell above no longer needs to be re-rendered per
-// request - this only ever holds compile-time-constant strings plus a
-// couple of numbers, never user-controllable text, so no JSON-escaping is
-// needed.
+// File-scope (not a stack local) so a deeply nested call chain (WiFi/OTA/WebServer all run
+// in this same task) never has to find room for it on the stack. Only ever holds
+// compile-time-constant strings plus a few numbers, never user-controllable text, so no
+// JSON-escaping is needed.
 static char s_json_body[1792];
 
 static size_t append_sources_json(char *buf, size_t bufSize, size_t offset) {
@@ -757,12 +723,10 @@ static void handle_api_set_schedule() {
     s_web_server.send(200, "application/json", build_status_json());
 }
 
-// Route/callback registration: allocates handler objects (WebServer::on()
-// appends a new FunctionRequestHandler to an internal linked list every
-// call, never replacing an existing one), so this must run exactly once for
-// the process lifetime - repeating it on every WiFi reconnect would leak a
-// handler each time. Safe to call before WiFi/services are up; it only
-// registers callbacks, it doesn't bind any socket.
+// Route/callback registration: WebServer::on() appends to an internal linked list every
+// call rather than replacing, so this must run exactly once for the process lifetime -
+// repeating it on reconnect would leak a handler. Safe before WiFi/services are up; only
+// registers callbacks, doesn't bind a socket.
 static void register_network_services() {
     ArduinoOTA.setHostname(WIFI_HOSTNAME);
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -776,16 +740,12 @@ static void register_network_services() {
     s_web_server.on("/api/set_schedule", HTTP_GET, handle_api_set_schedule);
 }
 
-// Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to
-// whatever WiFi connection is current. Unlike register_network_services()
-// above, this IS meant to be called again after every WiFi drop/reconnect -
-// see the call site. ArduinoOTA.begin() is a no-op once it thinks it's
-// already initialized, so without an explicit end() first, its UDP socket
-// stays bound to the old (torn-down) interface forever after a reconnect -
-// OTA/the web UI going permanently unreachable until a power cycle, while
-// Modbus (a fresh socket every poll) keeps working. The explicit
-// s_web_server.close() isn't strictly needed (begin() self-closes), but is
-// harmless and kept for symmetry.
+// Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to whatever WiFi
+// connection is current - unlike register_network_services() above, meant to be called
+// again on every reconnect. ArduinoOTA.begin() is a no-op once already initialized, so
+// without an explicit end() first its UDP socket stays bound to the torn-down interface,
+// leaving OTA/the web UI unreachable until a power cycle. s_web_server.close() isn't
+// strictly needed (begin() self-closes) but kept for symmetry.
 static void start_network_services() {
     ArduinoOTA.end();
     s_web_server.close();
@@ -793,11 +753,8 @@ static void start_network_services() {
     ArduinoOTA.begin();
     s_web_server.begin();
 
-    // UTC only, deliberately zero UTC/DST offsets - see config.h's scheduled-
-    // charging section for why timezone conversion lives in the browser
-    // instead of on-device. Re-issued on every reconnect alongside OTA/
-    // WebServer above so SNTP re-resolves NTP_SERVER against whatever DNS
-    // the current connection provides.
+    // UTC only, zero offset - timezone/DST conversion lives in the browser (config.h).
+    // Re-issued on every reconnect so SNTP re-resolves against the current connection's DNS.
     configTime(0, 0, NTP_SERVER);
 }
 
@@ -827,18 +784,12 @@ void solar_control_task(void *pvParameters) {
     for (;;) {
         uint32_t now = millis();
 
-        // Liveness signal for Core 1's independent recovery watchdog - see
-        // shared_state_heartbeat_solar_task() and the check in
-        // cp_interceptor_task(). Placed at the top of the loop so a hang
-        // anywhere below it (WiFi/OTA/WebServer/Modbus) is what actually
-        // gets caught, rather than being masked by a heartbeat that kept
-        // updating right up until the hang.
+        // Liveness signal for Core 1's recovery watchdog - placed at the top of the loop so
+        // a hang anywhere below (WiFi/OTA/WebServer/Modbus) is what actually gets caught.
         shared_state_heartbeat_solar_task();
 
-        // Picks up a new SSID/password/inverter IP committed over BLE (see
-        // ble_config.cpp). RuntimeConfig's generation only advances on a
-        // fully-applied BLE COMMIT, so cfg here is always a consistent
-        // snapshot - never a new SSID paired with a stale password.
+        // Picks up a new SSID/password/inverter IP committed over BLE. generation only
+        // advances on a fully-applied COMMIT, so cfg here is always a consistent snapshot.
         RuntimeConfig freshCfg = shared_state_get_runtime_config();
         if (freshCfg.generation != lastAppliedGeneration) {
             lastAppliedGeneration = freshCfg.generation;
@@ -853,12 +804,8 @@ void solar_control_task(void *pvParameters) {
         }
 
         if (WiFi.status() != WL_CONNECTED) {
-            // Drop servicesStarted so the reconnect branch below re-runs
-            // start_network_services() once WiFi comes back - see that
-            // function's comment for why a stale ArduinoOTA/WebServer
-            // binding left over from before the drop won't recover on its
-            // own otherwise. Harmless to set repeatedly while already
-            // disconnected.
+            // Re-runs start_network_services() once WiFi comes back (see that function's
+            // comment for why a stale binding won't recover on its own).
             servicesStarted = false;
             if (now - lastWifiAttemptMs >= WIFI_RECONNECT_INTERVAL_MS) {
                 lastWifiAttemptMs = now;
@@ -911,11 +858,8 @@ void solar_control_task(void *pvParameters) {
                 float gridPowerW;
                 float voltageV;
                 float batteryPowerW;
-                // currentDrawW is derived from the previous poll's voltage -
-                // this poll's own voltage isn't known until the read call
-                // below returns it. Negligible staleness, consistent with
-                // the rest of this loop's one-poll-delayed self-referential
-                // design.
+                // Derived from the previous poll's voltage - this poll's own voltage isn't
+                // known until the read call below returns it; negligible staleness.
                 float currentDrawW = targetAmps * s_last_mains_voltage_v;
                 if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV, batteryPowerW)) {
                     status.modbus_ok = true;
@@ -925,20 +869,12 @@ void solar_control_task(void *pvParameters) {
                     status.last_poll_success_ms = lastPollSuccessMs;
                     s_last_mains_voltage_v = voltageV;
 
-                    // Exclude home-battery discharge from what counts as
-                    // surplus for EV charging - the grid meter alone can't
-                    // tell "exporting because of fresh PV" apart from
-                    // "exporting because the home battery is discharging",
-                    // and diverting the latter into EV charging would mean
-                    // charging the car from the house battery instead of
-                    // solar. -batteryPowerW is positive exactly when
-                    // discharging; adding that magnitude back to gridPowerW
-                    // (negative when exporting) cancels its contribution to
-                    // apparent export. Battery charging (batteryPowerW > 0)
-                    // adds 0 here and is correctly left alone - that PV was
-                    // already consumed, not freed up. See grid_data_source.h's
-                    // outBatteryW doc comment and CLAUDE.md "Solar data
-                    // source".
+                    // Exclude home-battery discharge from EV-charging surplus - the meter
+                    // alone can't tell fresh-PV export from battery-discharge export.
+                    // -batteryPowerW is positive exactly when discharging, so adding it
+                    // back to gridPowerW cancels its contribution; battery charging adds 0
+                    // and is left alone (that PV was already consumed). See
+                    // grid_data_source.h's outBatteryW doc comment.
                     float effectiveGridPowerW = gridPowerW + fmaxf(0.0f, -batteryPowerW);
 
                     // Polling still runs (and still updates status/display)

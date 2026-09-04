@@ -1,25 +1,15 @@
 #include "grid_data_source.h"
 #include "config.h"
 
-// Reactive simulated grid source - not a real meter/inverter integration,
-// but unlike a fixed-value source, this one models the EV's own draw
-// feeding back into the reading, the way a real meter always does. A fixed
-// source reports the same wattage forever regardless of how much current is
-// already committed, so the control loop just keeps adding more until it
-// hits MAX_CURRENT_A - it never converges, because there's no real physical
-// constraint behind the number (see CLAUDE.md "Resolved", 2026-09-03). This
-// source instead assumes a fixed PV capacity and house load, then subtracts
-// currentDrawW (the wattage solar_control.cpp is currently commanding for
-// charging) each poll, so reported export genuinely shrinks toward zero as
-// target amps rises - letting the self-referential control loop (see
-// CLAUDE.md "Control loop is self-referential") actually be bench-tested
-// end-to-end without real hardware.
+// Reactive simulated grid source: models a fixed PV capacity and house load, then
+// subtracts currentDrawW (the wattage currently commanded for charging) each poll, so
+// reported export shrinks toward zero as target amps rises - letting the self-referential
+// control loop actually converge in bench testing (a constant-value source never does,
+// since it never accounts for the EV's own draw - see CLAUDE.md "Resolved").
 //
-// This is the "moderate sun" member of the reactive family (see also
-// grid_source_simulated_reactive_no_sun.cpp / _low.cpp / _high.cpp) - values
-// chosen so the equilibrium point, (capacity - load) / mains voltage, lands
-// well inside the 6-32A range at the fixed 240V simulated mains voltage
-// (~13.3A) rather than at either extreme.
+// "Moderate sun" member of the reactive family (see also _no_sun/_low/_high.cpp) - values
+// chosen so the equilibrium point lands well inside the 6-32A range (~13.3A) rather than
+// at either extreme.
 static const float SIMULATED_PV_CAPACITY_W = 4000.0f;
 static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 

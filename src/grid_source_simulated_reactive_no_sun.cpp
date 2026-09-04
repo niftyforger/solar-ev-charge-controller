@@ -1,11 +1,8 @@
 #include "grid_data_source.h"
 #include "config.h"
 
-// Reactive simulated grid source (see grid_source_simulated_reactive_moderate.cpp
-// for the general rationale) - the "no sun" member of the family. Zero PV
-// capacity means it always reports a deficit (at least the house load), so
-// it should never clear the 6A floor and never enter charging regardless of
-// how long it's selected - a pure night-time/no-solar scenario.
+// Reactive simulated source (see _moderate.cpp for the general rationale) - "no sun"
+// member: zero PV means always a deficit, so it should never clear the 6A floor.
 static const float SIMULATED_PV_CAPACITY_W = 0.0f;
 static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 
