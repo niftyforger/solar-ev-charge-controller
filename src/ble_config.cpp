@@ -7,24 +7,18 @@
 #include <string.h>
 #include <strings.h>
 
-// Nordic UART Service (NUS) UUIDs - a de facto standard single write/notify
-// characteristic pair that BLE serial-terminal apps (Serial Bluetooth
-// Terminal, nRF Connect's UART plugin, etc.) auto-detect and switch into
-// terminal mode for, instead of presenting a raw per-characteristic GATT
-// browser. RX is phone->device, TX is device->phone.
+// Nordic UART Service (NUS) UUIDs - BLE serial-terminal apps auto-detect this pair and
+// switch into terminal mode, instead of a raw per-characteristic GATT browser. RX is
+// phone->device, TX is device->phone.
 static const char *SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *CHAR_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *CHAR_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
 static const char *NVS_NAMESPACE = "netcfg";
 
-// Gates every SET/COMMIT command behind a dedicated BLE password
-// (RuntimeConfig.ble_password - never OTA_PASSWORD, which is used only for
-// OTA flashing, see CLAUDE.md), sent first as "AUTH <password>". A single
-// global flag (not per-connection) is deliberately sufficient here - this
-// is a single-operator bench device, not a multi-tenant service - and it is
-// reset on every new connection so a stale authenticated state can never
-// carry over to a different client.
+// Gates every SET/COMMIT command behind RuntimeConfig.ble_password (never OTA_PASSWORD),
+// sent first as "AUTH <password>". A single global flag is sufficient - single-operator
+// device, not multi-tenant - and reset on every new connection.
 static bool s_authenticated = false;
 
 // Staged (not-yet-committed) config values. Pre-loaded from NVS at boot so
@@ -243,19 +237,13 @@ static void handle_set_web_pass(const char *arg) {
     send_line("OK");
 }
 
-// Deliberately never includes the staged WiFi password or either BLE/web
-// password - AUTH gates writes, but STATUS itself needs no auth (nothing it
-// reports is secret), so this is the one place a password-shaped leak could
-// otherwise sneak in.
+// Never includes the staged WiFi password or either BLE/web password - STATUS needs no
+// auth (nothing it reports is secret), so this is the one place a leak could sneak in.
 //
-// Sent as ONE multi-line notify() rather than one call per line: firing
-// several notify()s back-to-back outraces the actual radio transmission (a
-// BLE connection only sends at its negotiated connection interval, not
-// instantly per call), so the terminal app can end up rendering lines
-// interleaved/garbled rather than in order - bench-observed as everything
-// running together on one ugly-wrapping line. A single notify() with
-// embedded "\r\n"s sidesteps that entirely, and easily fits in one packet
-// under the 247-byte MTU requested in ble_config_init().
+// Sent as ONE multi-line notify() rather than one call per line: separate notify()s
+// outrace the actual radio transmission (BLE only sends at its connection interval), so
+// the terminal app can render lines interleaved/garbled (bench-observed) - a single
+// notify() with embedded "\r\n"s avoids that and fits in one packet under the 247-byte MTU.
 static void handle_status() {
     RuntimeConfig cfg = shared_state_get_runtime_config();
     String deviceIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("0.0.0.0");

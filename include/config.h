@@ -2,13 +2,8 @@
 
 #include <stdint.h>
 
-// ---------------------------------------------------------------------------
-// Pin assignments
-//
-// ESP32-S3: ADC1 = GPIO1-10 (ADC2 shares hardware with WiFi, avoid it).
+// Pin assignments. ESP32-S3: ADC1 = GPIO1-10 (ADC2 shares hardware with WiFi, avoid it).
 // Strapping pins (0, 3, 45, 46) and USB-JTAG pins (19, 20) are avoided.
-// Confirm against the actual bring-up wiring before first power-up.
-// ---------------------------------------------------------------------------
 
 // CP sense input (post opto-isolator, digital 0/3.3V square wave)
 #define CP_PWM_SENSE_GPIO      5
@@ -16,27 +11,14 @@
 // CP clamp drive output -> optocoupler -> MOSFET gate driver (RMT TX)
 #define CLAMP_DRIVE_GPIO       6
 
-// CP connector-state sense, CONNECTED_IN (post opto, digital 0/3.3V). Level
-// discrimination happens in hardware (LM393 dual comparator U2 against
-// REF_CONN ~2.5V/REF_EDGE ~0.45V - see CLAUDE.md "CP interception circuit");
-// this GPIO just reads U2B's digital output, so it doesn't need to be
-// ADC1-capable.
+// CP connector-state sense, CONNECTED_IN (post opto) - see CLAUDE.md "CP interception circuit"
 #define CP_CONNECTED_SENSE_GPIO 4
 
-// CP disconnect relay drive -> optocoupler -> relay coil driver transistor.
-// Drives a normally-closed (NC) relay in series on CP_LINE, downstream of
-// the sense/clamp tap, between the tap and the vehicle connector - see
-// CLAUDE.md "CP interception circuit". Energized (this GPIO driven high)
-// opens the relay, isolating the vehicle's CP termination so the EVSE
-// reads the line as unplugged (state A) and stops charging on its own.
-// De-energized (GPIO low, including all power-loss/not-yet-initialized
-// cases) is the NC/default/closed state - native pass-through - matching
-// the same fail-safe direction as CLAMP_DRIVE/R3.
+// CP disconnect relay drive -> opto -> coil driver. NC relay in series on CP_LINE;
+// energizing opens it (EVSE reads state A). De-energized/no-drive = closed = pass-through.
 #define CP_DISCONNECT_RELAY_GPIO 7
 
-// ---------------------------------------------------------------------------
 // CP electrical / protocol constants (IEC 61851-1 / SAE J1772 §6.4)
-// ---------------------------------------------------------------------------
 #define CP_MIN_DUTY_PCT         10.0f
 #define CP_MAX_DUTY_PCT         96.0f
 #define CP_DUTY_PCT_PER_AMP     (1.0f / 0.6f)   // duty% = amps / 0.6
@@ -44,186 +26,101 @@
 #define MIN_CURRENT_A            6.0f
 #define MAX_CURRENT_A            32.0f
 
-// Grid voltage is per-GridDataSource, not a manually-configured global
-// setting (see grid_data_source.h's GridDataSourceReadFn) - GRID_SOURCE_SUNGROW_WINET
-// reads the real value from the inverter, every simulated/reactive source
-// reports this fixed value instead (not every real install is 240V, but a
-// simulated source has no real grid to read from). Also used as
-// grid_source_sungrow_winet.cpp's fallback before its first successful
-// voltage register read.
+// Grid voltage is per-GridDataSource (see grid_data_source.h); this is the fixed value
+// simulated sources report and grid_source_sungrow_winet.cpp's fallback before its
+// first successful voltage-register read.
 #define MAINS_VOLTAGE_FIXED_V    240.0f
 
 // Native PWM sanity window (~1kHz nominal, generous guard band against glitches)
 #define NATIVE_PERIOD_MIN_US     800.0
 #define NATIVE_PERIOD_MAX_US     1300.0
 
-// Only bother arming the clamp if it actually shortens the pulse by at least
-// this many percentage points of duty - avoids relay/MOSFET/RMT churn for
-// no meaningful effect.
+// Only arm the clamp if it shortens the pulse by at least this much - avoids relay/MOSFET/RMT churn for no effect.
 #define MIN_CLAMP_MARGIN_PCT     0.5f
 
-// Systematic compensation for the total latency between the rising-edge ISR
-// arming the hardware timer and the RMT hardware actually asserting the
-// clamp: cp_sense_isr() -> timer alarm -> assert_timer_isr() (genuine
-// interrupt context, no FreeRTOS task dispatch - see cp_interceptor.cpp) ->
-// raw RMT register write (rmt_ll_write_memory()/rmt_ll_tx_start()).
-//
-// Current value (5.7us) is a single bench sample at one duty point (10%),
-// taken against the current raw-register/ESP_INTR_FLAG_IRAM ISR path (see
-// cp_hw_init()/assert_timer_isr() in cp_interceptor.cpp) - re-derive with
-// more samples/duty points and a scope once real hardware (not the bench
-// simulator) is available. Any ISR-path rewrite invalidates this figure and
-// requires recalibration, since it's measuring that path's own overhead.
+// Compensates the rising-edge-ISR -> hardware-timer -> RMT-assert dispatch latency (see
+// assert_timer_isr() in cp_interceptor.cpp). Bench-measured (5.7us, single sample at 10%
+// duty); re-derive with a scope if the ISR path is ever rewritten.
 #define CLAMP_DISPATCH_LATENCY_US   5.7
 
-// Hysteresis band for *dropping back* to STANDBY once already OSCILLATING:
-// target must fall below MIN_CURRENT_A - HYSTERESIS_A, not just below
-// MIN_CURRENT_A, so noise sitting right at the floor can't flap the clamp
-// on/off every planning pass. Entering OSCILLATING from STANDBY uses the
-// bare MIN_CURRENT_A floor with no margin - 10% duty is itself a fully
-// valid signal, not a marginal one. The margin must stay on the exit side
-// only, not entry too (see cp_interceptor.cpp) - putting it on entry means
-// settling exactly at the floor never leaves STANDBY. Placeholder value -
-// tune empirically.
+// Exit-from-OSCILLATING margin below MIN_CURRENT_A, to stop noise at the floor from
+// flapping the clamp. Entry uses the bare floor, no margin (10% duty is a fully valid
+// signal). Confirmed adequate against the real vehicle, 2026-09-04.
 #define HYSTERESIS_A             1.0f
 
-// Minimum time the CP_STANDBY/CP_OSCILLATING duty state (and therefore the
-// disconnect relay's position - see CP_DISCONNECT_RELAY_GPIO) must be held
-// before it's allowed to flip again, on top of the amps hysteresis above.
-// Two reasons this exists, independent of noise-driven flapping already
-// handled by HYSTERESIS_A: a mechanical relay has finite cycle life, and
-// every relay-open/relay-close cycle forces the EVSE and vehicle through
-// a fresh unplug/replug handshake, which takes real time and shouldn't be
-// re-triggered faster than it can complete. Placeholder value - tune once
-// real handshake timing is observed on the bench.
+// Minimum hold time for the CP_STANDBY/CP_OSCILLATING duty state (and therefore the
+// disconnect relay) before it can flip again, on top of HYSTERESIS_A - bounds relay
+// cycle life and gives the EVSE/vehicle time to complete an unplug/replug handshake.
+// Confirmed adequate against the real vehicle, 2026-09-04.
 #define RELAY_MIN_DWELL_MS       10000UL
 
-// ---------------------------------------------------------------------------
-// Connector-state discrimination
+// Connector-state discrimination: one CONNECTED_IN threshold (REF_CONN, A vs B) and one
+// EDGE_IN threshold (REF_EDGE, D vs E) give four buckets, not six - A; B; C incl. D
+// (toggling); FAULT incl. E/F (steady-low). D is unused on this install and E/F both
+// already mean "don't clamp", so the conflation costs status granularity only. See
+// read_connector_state() in cp_interceptor.cpp and CLAUDE.md "CP interception circuit".
 //
-// Level discrimination happens in hardware (U2, LM393 dual comparator - see
-// CP_CONNECTED_SENSE_GPIO above and CLAUDE.md "CP interception circuit").
-// Software just combines CONNECTED_IN's level with EDGE_IN's (CP_PWM_SENSE_GPIO)
-// recent activity/level - see read_connector_state() in cp_interceptor.cpp.
-// One CONNECTED_IN threshold (REF_CONN, between state A and B) and one
-// EDGE_IN threshold (REF_EDGE, between state D and E) give four resolvable
-// buckets, not the full six CP levels: A (not connected); B (connected,
-// EDGE_IN steady-high); C incl. D (connected, EDGE_IN toggling recently);
-// FAULT incl. E/F (connected, EDGE_IN steady-low). C/D and E/F are each
-// conflated - the amplitude difference a digital comparator discards.
-// Accepted: D (ventilated charging) is unused on this install, and E/F both
-// already map to "don't clamp", so the conflation costs status granularity
-// only, not control-loop safety.
-//
-// CP_ACTIVITY_TIMEOUT_US is how long since the last rising edge before
-// read_connector_state() stops considering the line "currently
-// oscillating". Sized a few native periods above NATIVE_PERIOD_MAX_US so
-// normal jitter can't cause a false "not oscillating" read, while staying
-// far shorter than CP_STATUS_PUBLISH_MS so a real stop is reflected
-// promptly.
+// How long since the last rising edge before read_connector_state() calls the line "not
+// oscillating" - sized above NATIVE_PERIOD_MAX_US to tolerate jitter, well below
+// CP_STATUS_PUBLISH_MS so a real stop shows up promptly.
 #define CP_ACTIVITY_TIMEOUT_US   3000
 
-// ---------------------------------------------------------------------------
 // RMT (legacy driver/rmt.h - ESP-IDF 4.4 bundled with this platform version)
-// ---------------------------------------------------------------------------
 #define CP_RMT_TX_CHANNEL        RMT_CHANNEL_0
 #define RMT_CLK_DIV              8       // 80MHz APB / 8 = 10MHz -> 0.1us/tick
 
-// ---------------------------------------------------------------------------
-// Core 1 CP task timing
-// ---------------------------------------------------------------------------
-// cp_interceptor_task's planning-loop cadence (vTaskDelay). Not in the
-// timing-critical path - cp_sense_isr() applies the clamp plan directly on
-// each rising edge, independent of this loop. See cp_interceptor.cpp.
+// Core 1 CP task timing. cp_interceptor_task's planning loop is not on the timing-critical
+// path - cp_sense_isr() applies the clamp plan directly on each rising edge.
 #define CP_NOTIFY_WAIT_MS         100
 #define CP_STALE_CHECK_MS         1000
 #define CP_STATUS_PUBLISH_MS      200
 #define CP_TASK_WDT_TIMEOUT_MS    3000
 
-// Independent recovery watchdog for solar_control_task (Core 0), checked by
-// Core 1 - see shared_state_heartbeat_solar_task() in shared_state.h and the
-// check in cp_interceptor_task(). Deliberately separate from
-// CP_TASK_WDT_TIMEOUT_MS's esp_task_wdt_add() mechanism: solar_control_task
-// legitimately blocks far longer than 3s during an ArduinoOTA push (Core 0
-// blocks on flash writes for the whole transfer), so registering it on the
-// CP task's tight watchdog would abort every real OTA update. Sized
-// comfortably above any expected OTA duration for this firmware's image
-// size on local WiFi.
+// Separate recovery watchdog for solar_control_task, checked by Core 1 (see
+// shared_state_heartbeat_solar_task()). Kept independent of CP_TASK_WDT_TIMEOUT_MS
+// because solar_control_task legitimately blocks much longer than 3s during an
+// ArduinoOTA push - sized comfortably above any expected OTA duration.
 #define SOLAR_TASK_HEARTBEAT_TIMEOUT_MS 120000UL
 
-// ---------------------------------------------------------------------------
 // Core 0 solar control loop
-// ---------------------------------------------------------------------------
 #define POLL_INTERVAL_MS          5000UL
 #define STALE_DATA_TIMEOUT_MS     60000UL
 #define SETTLE_MS                 15000UL
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
 #define WIFI_HOSTNAME              "solar-ev-charger"
 
-// ---------------------------------------------------------------------------
-// BLE config server (WiFi SSID/password, inverter IP - see ble_config.cpp).
-// WiFi/inverter-IP are provisioned entirely over BLE and stored in NVS;
-// there is no compile-time fallback (see CLAUDE.md "BLE configuration").
-// ---------------------------------------------------------------------------
+// BLE config server (WiFi SSID/password, inverter IP - see ble_config.cpp). Provisioned
+// entirely over BLE into NVS; no compile-time fallback (see CLAUDE.md "BLE configuration").
 #define BLE_DEVICE_NAME            "solar-ev-charger"
 
-// How long after each boot BLE advertises, once the device has already been
-// provisioned at least once (an unprovisioned device - no SSID yet stored in
-// NVS - advertises indefinitely regardless of this value, since BLE is the
-// only way in and a time limit there could brick a factory-fresh board out
-// of range of its one configuration path). Placeholder - tune once real
-// provisioning-workflow timing is observed on the bench.
+// How long BLE advertises after boot once provisioned at least once (an unprovisioned
+// device advertises indefinitely regardless, since BLE is the only configuration path).
 #define BLE_ADVERTISE_WINDOW_MS    300000UL
 
-// How often to nudge a connected-but-idle BLE client with a hint to send
-// HELP, until they've sent anything at all - see ble_config.cpp. Repeating
-// (rather than a single banner right on connect) also sidesteps a client
-// not yet having subscribed to notifications at the instant of connection -
-// an early nudge landing before that subscription is simply dropped, and a
-// later one gets through.
+// How often to nudge a connected-but-idle BLE client to send HELP. Repeated rather than
+// a single on-connect banner, since a client not yet subscribed to notifications would miss it.
 #define BLE_IDLE_HELP_INTERVAL_MS  5000UL
 
-// HTTP control page port. Night-time / no-sun bench testing uses the fixed
-// simulated grid sources (see grid_source_simulated_export.cpp /
-// grid_source_simulated_import.cpp) selected from this same page rather
-// than a separate sim mode - see CLAUDE.md "Solar data source".
+// HTTP control page port. Bench/night-time testing uses the simulated grid sources
+// selected from this same page rather than a separate sim mode - see CLAUDE.md "Solar data source".
 #define SIM_HTTP_PORT              80
 
-// ---------------------------------------------------------------------------
-// Scheduled (fixed-current) charging
-//
-// No RTC/timezone/DST logic on-device by design: the board syncs via NTP to
-// UTC only, the schedule's start/end are stored and evaluated in UTC, and
-// the control page's own JS converts to/from the viewer's local time at
-// edit/display time using the browser's Date object - see solar_control.cpp's
-// PAGE_HTML. This also means a DST transition never needs a firmware update
-// or manual re-entry - the browser just re-converts correctly next time the
-// page is opened.
-// ---------------------------------------------------------------------------
+// Scheduled (fixed-current) charging. No RTC/timezone/DST logic on-device: synced via NTP
+// to UTC only, schedule stored/evaluated in UTC, and the control page's JS converts
+// to/from the viewer's local time at edit/display time - see solar_control.cpp's PAGE_HTML.
 #define NTP_SERVER                 "pool.ntp.org"
 
-// Below this, time(nullptr) is treated as "NTP hasn't synced yet" rather
-// than a real timestamp - the ESP32's clock starts at an epoch far in the
-// past (0, or the mid-2000s depending on core version) until SNTP first
-// succeeds. A fixed point comfortably in the past (2023-11-14) rather than
-// "now" so this constant never needs bumping.
+// Below this, time(nullptr) is treated as "NTP hasn't synced yet" rather than real - a
+// fixed point in the past (2023-11-14) so this constant never needs bumping.
 #define NTP_MIN_VALID_EPOCH        1700000000UL
 
-// ---------------------------------------------------------------------------
-// Grid data source
-// ---------------------------------------------------------------------------
-// Which meter/inverter link supplies the grid-power figure is modular and
-// selected at runtime from the HTTP control page (see src/grid_data_source.h,
-// src/grid_data_source_registry.cpp, and handle_set_source() in
-// solar_control.cpp) - not a compile-time #define. The selection persists
-// across reboots in its own NVS namespace ("gridsrc"), independent of the
-// BLE-provisioned WiFi/inverter config in ble_config.cpp. Source-specific
-// parameters (Modbus registers, port, unit ID) live with their
+// Grid data source: which meter/inverter link supplies the grid-power figure is modular
+// and selected at runtime from the HTTP control page (see grid_data_source.h,
+// grid_data_source_registry.cpp, handle_set_source() in solar_control.cpp), persisted in
+// its own NVS namespace ("gridsrc"). Source-specific parameters live with their
 // implementation (e.g. grid_source_sungrow_winet.cpp), not here.
 
-// ---------------------------------------------------------------------------
 // FreeRTOS task priorities / core pinning
-// ---------------------------------------------------------------------------
 #define CORE_SOLAR                0
 #define CORE_CP                   1
 #define TASK_PRIO_CP              (configMAX_PRIORITIES - 1)

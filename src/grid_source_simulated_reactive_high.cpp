@@ -1,12 +1,9 @@
 #include "grid_data_source.h"
 #include "config.h"
 
-// Reactive simulated grid source (see grid_source_simulated_reactive_moderate.cpp
-// for the general rationale) - the "high sun" member of the family. Net
-// surplus (capacity - load) is 8200W (34.2A at the fixed 240V simulated
-// mains voltage), deliberately more than MAX_CURRENT_A (32A) can use -
-// confirms the control loop converges to and holds at the ceiling
-// (DECISION_CAPPED_MAX) rather than exceeding it.
+// Reactive simulated source (see _moderate.cpp for the general rationale) - "high sun"
+// member: net surplus (8200W, 34.2A at 240V) exceeds MAX_CURRENT_A (32A), confirming the
+// control loop converges to and holds at the ceiling rather than exceeding it.
 static const float SIMULATED_PV_CAPACITY_W = 9000.0f;
 static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 
