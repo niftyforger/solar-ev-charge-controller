@@ -24,10 +24,45 @@
 #define SUNGROW_WINET_REG_GRID_VOLTAGE       5018    // U16, x0.1V
 #define SUNGROW_WINET_REG_GRID_VOLTAGE_COUNT 1
 #define SUNGROW_WINET_GRID_VOLTAGE_SCALE     0.1f
+// Battery power. The community-documented assumption (S32 spanning
+// 13021-13022, mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant) produced
+// an obviously-bogus 58,067,088 W reading in real-hardware testing
+// (2026-09-04) - the same kind of wrong-versus-community-convention mismatch
+// 13009 needed two rounds of correction for.
+//
+// Corrected the same day by bypassing the firmware and querying the
+// WiNet-S's Modbus TCP interface directly with a standalone script while
+// the Sungrow app showed ~535W of real battery discharge (cloudy day,
+// battery covering most of the house load): sampling registers 13015-13040
+// repeatedly showed 13021 alone tracking that discharge (~480-700W over the
+// correlation window, right order of magnitude and right sign once negated)
+// while 13022 stayed essentially uncorrelated - i.e. 13021 is a standalone
+// S16 register, not the low half of an S32 pair with 13022. (13022 is some
+// other, unidentified quantity - possibly a rated/config value rather than
+// live telemetry, since it barely moved.) Wire polarity is positive =
+// charging, same community convention as the grid-power register, and also
+// inverted from reality here the same way - negate for the codebase's
+// negative = discharging convention.
+//
+// Residual uncertainty: the corrected reading (~484W) was about 10% below
+// the app's simultaneous 535W, plausibly just correlation-window skew on a
+// cloudy/fluctuating day rather than a wrong scale factor - re-check against
+// a steadier charge/discharge event if it ever looks consistently off by a
+// similar margin. SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W below still
+// guards against a mismapped/garbage read regardless.
+#define SUNGROW_WINET_REG_BATTERY_POWER      13021   // S16, W, raw register is positive = charging;
+                                                       // sungrow_winet_read_power_w() negates it, see
+                                                       // comment above
+#define SUNGROW_WINET_REG_BATTERY_POWER_COUNT 1
+// Generous bound, well above any residential battery pack's real
+// charge/discharge power - exists only to catch a mismapped/garbage
+// register (see comment above), not as a precise spec limit.
+#define SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W 20000.0f
 #define SUNGROW_WINET_MODBUS_TIMEOUT_MS   2000
 
 static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
-                                         float &outWatts, float &outVoltageV) {
+                                         float &outWatts, float &outVoltageV,
+                                         float &outBatteryW) {
     // Persistent connection reused across polls (only ever runs serially on
     // Core 0's solar_control_task, so a function-local static is safe) - see
     // CLAUDE.md "Firmware implementation".
@@ -67,6 +102,39 @@ static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
         Serial.printf("[modbus] voltageReg=0x%04X grid_voltage_v=%.1f\n", voltageReg[0], lastGoodVoltageV);
     }
     outVoltageV = lastGoodVoltageV;
+
+    // Battery power is a secondary reading here, same reasoning as voltage
+    // above: a miss only means solar_control_task can't exclude battery
+    // discharge from surplus this poll, never a safety issue (the clamp
+    // topology can only ever clip current down - see CLAUDE.md "Inherent
+    // fail-safe properties"), so a failed read falls back to the last
+    // known-good value, or 0.0f (assume no battery activity - the safe
+    // direction, since it makes the exclusion a no-op) if none yet.
+    static float lastGoodBatteryW = 0.0f;
+    uint16_t batteryRegs[SUNGROW_WINET_REG_BATTERY_POWER_COUNT];
+    if (client.readInputRegisters(SUNGROW_WINET_REG_BATTERY_POWER, SUNGROW_WINET_REG_BATTERY_POWER_COUNT, batteryRegs)) {
+        // Single S16 register, wire polarity positive=charging - negate for
+        // the codebase's negative=discharging convention. See the comment on
+        // SUNGROW_WINET_REG_BATTERY_POWER above for how this was corrected
+        // from the original (wrong) S32 assumption.
+        int16_t rawBattery = (int16_t)batteryRegs[0];
+        float batteryReadingW = -(float)rawBattery;
+        Serial.printf("[modbus] batteryRegs[0]=0x%04X raw=%d battery_power_w=%.0f (%s)\n",
+                      batteryRegs[0], rawBattery, batteryReadingW,
+                      batteryReadingW < 0 ? "discharging" : (batteryReadingW > 0 ? "charging" : "idle"));
+        // Reject anything outside SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W as
+        // a mismapped/garbage register read (see comment on
+        // SUNGROW_WINET_REG_BATTERY_POWER) rather than trusting it - same
+        // fallback-to-last-known-good treatment as a failed
+        // readInputRegisters() call above.
+        if (fabsf(batteryReadingW) <= SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W) {
+            lastGoodBatteryW = batteryReadingW;
+        } else {
+            Serial.printf("[modbus] battery_power_w %.0f exceeds sanity bound (%.0f), rejecting - register mapping still unconfirmed, see CLAUDE.md\n",
+                          batteryReadingW, SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W);
+        }
+    }
+    outBatteryW = lastGoodBatteryW;
     return true;
 }
 

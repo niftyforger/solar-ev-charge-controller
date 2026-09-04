@@ -11,9 +11,11 @@ static const float SIMULATED_PV_CAPACITY_W = 2200.0f;
 static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 
 static bool simulated_reactive_low_read_power_w(IPAddress /*host*/, float currentDrawW,
-                                                   float &outWatts, float &outVoltageV) {
+                                                   float &outWatts, float &outVoltageV,
+                                                   float &outBatteryW) {
     outWatts = currentDrawW + SIMULATED_HOUSE_LOAD_W - SIMULATED_PV_CAPACITY_W; // negative = exporting
     outVoltageV = MAINS_VOLTAGE_FIXED_V;
+    outBatteryW = 0.0f; // no battery modeled
     return true;
 }
 
