@@ -95,7 +95,7 @@ Freenove ESP32-S3-WROOM on its breakout board. Dual-core split:
 | Core 0 | WiFi, Modbus TCP polling of the inverter, control law, BLE config server, OTA, sim-mode web page |
 | Core 1 (pinned, high priority) | GPIO edge-triggered ISR + hardware timer + RMT — asserts/releases the CP clamp with sub-task-switch latency |
 
-Pin assignments live in [`include/config.h`](include/config.h) (see CLAUDE.md for the full table and rationale) — physically confirmed during bench-testing stages 0-2.
+Pin assignments live in [`include/config.h`](include/config.h) (see CLAUDE.md for the full table and rationale) — physically confirmed on the bench.
 
 ## Firmware layout
 
@@ -134,4 +134,4 @@ Once WiFi is up, subsequent flashes can go over OTA (`ArduinoOTA`, password-prot
 
 ## Status
 
-Bench-tested against a CP simulator (stand-in oscillator + switchable vehicle termination) and against the real EVSE with the simulator standing in for the vehicle: BLE provisioning, comparator thresholds, and disconnect-relay open/close all confirmed clean, no changes needed. Still outstanding: bring-up against a real vehicle, which is what resolves whether it accepts live mid-charge duty-cycle changes or needs a brief state transition first — see [CLAUDE.md § Open questions](CLAUDE.md#open-questions-for-implementation).
+Bench-tested through all stages, including the real EVSE and a real vehicle (2026-09-04): BLE provisioning, comparator thresholds, disconnect-relay open/close, and live mid-charge duty-cycle changes all confirmed clean, no state-B blip needed. Remaining open item is a design-philosophy call, not a bring-up gap — see [CLAUDE.md § Open questions](CLAUDE.md#open-questions-for-implementation).

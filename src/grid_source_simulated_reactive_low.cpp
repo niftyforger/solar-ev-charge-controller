@@ -1,12 +1,9 @@
 #include "grid_data_source.h"
 #include "config.h"
 
-// Reactive simulated grid source (see grid_source_simulated_reactive_moderate.cpp
-// for the general rationale) - the "low sun" member of the family. Net
-// surplus (capacity - load) is 1400W, ~40W under the 1440W the 6A floor
-// needs at the fixed 240V simulated mains voltage - deliberately just below
-// the entry threshold to confirm it correctly never enters charging, the
-// reactive equivalent of the old fixed below-floor test.
+// Reactive simulated source (see _moderate.cpp for the general rationale) - "low sun"
+// member: net surplus (1400W) is ~40W under the 1440W the 6A floor needs at 240V,
+// deliberately just below the entry threshold to confirm it never enters charging.
 static const float SIMULATED_PV_CAPACITY_W = 2200.0f;
 static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 
