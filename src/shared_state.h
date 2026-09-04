@@ -27,6 +27,7 @@ enum ConnectorState {
 
 struct SolarStatus {
     float grid_power_w;          // negative = exporting
+    float battery_power_w;       // positive = charging, negative = discharging, 0 = idle/no battery
     uint32_t last_poll_success_ms;
     bool wifi_connected;
     bool modbus_ok;

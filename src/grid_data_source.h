@@ -18,8 +18,23 @@
 // outVoltageV lets each source report its own grid voltage rather than
 // relying on one manually-configured global value - GRID_SOURCE_SUNGROW_WINET
 // reads the real value from the inverter, every simulated source reports a
-// fixed MAINS_VOLTAGE_FIXED_V (config.h). Returns true on success.
-typedef bool (*GridDataSourceReadFn)(IPAddress host, float currentDrawW, float &outWatts, float &outVoltageV);
+// fixed MAINS_VOLTAGE_FIXED_V (config.h).
+//
+// outBatteryW reports the home battery's own power flow, independent of
+// currentDrawW/outWatts above: positive = charging (energy entering the
+// battery), negative = discharging (energy leaving it), 0 = idle or no
+// battery modeled - the same "negative = leaving the point of reference"
+// convention as the grid reading. This exists so solar_control_task can
+// exclude battery-discharge power from the surplus it hands to the EV -
+// grid power alone can't distinguish "the meter is exporting because of
+// fresh PV" from "the meter is exporting because the home battery is
+// discharging", and diverting the latter into EV charging would mean
+// charging the car from the house battery instead of solar (see CLAUDE.md
+// "Solar data source"). A source with no battery (every simulated source
+// except GRID_SOURCE_SIMULATED_REACTIVE_BATTERY_DISCHARGE) just reports
+// 0.0f, making the exclusion a no-op. Returns true on success.
+typedef bool (*GridDataSourceReadFn)(IPAddress host, float currentDrawW, float &outWatts,
+                                       float &outVoltageV, float &outBatteryW);
 
 struct GridDataSource {
     // Short, stable machine key (e.g. "sungrow_winet"). This is what gets
@@ -49,6 +64,16 @@ extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_NO_SUN;
 extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_LOW;
 extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_MODERATE;
 extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_HIGH;
+
+// Models a home battery discharging into apparent grid export with little or
+// no PV behind it, so the reading looks like solar surplus (outWatts
+// negative/exporting) while outBatteryW correctly reports the discharge -
+// the only way to bench-verify the battery-discharge exclusion in
+// solar_control_task without real hardware (see grid_data_source.h's
+// outBatteryW doc comment above and CLAUDE.md "Solar data source"). Target
+// amps should stay pinned near the 6A floor with this source selected,
+// despite outWatts showing a large export.
+extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_BATTERY_DISCHARGE;
 
 // All sources compiled into this build, selectable at runtime from the HTTP
 // control page (see solar_control.cpp) instead of a compile-time #define.

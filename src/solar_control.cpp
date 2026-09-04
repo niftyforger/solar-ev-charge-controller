@@ -395,8 +395,10 @@ select{width:100%}
           <div class="stat-sub" id="pollFailedNote" style="display:none;color:var(--bad)">Last poll failed</div>
         </div>
         <div class="kv"><span>Power</span><span><span class="flow-dot" id="gridFlow" style="display:inline-block;vertical-align:middle;margin-right:6px"></span><span id="gridWatts">--</span></span></div>
+        <div class="kv"><span>Battery</span><span id="batteryWatts">--</span></div>
         <div class="kv"><span>Voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
+        <div id="batteryExcludedNote" class="stat-sub" style="display:none"></div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
           Data is stale &mdash; CP will fail safe to native pass-through.
         </div>
@@ -462,6 +464,14 @@ select{width:100%}
     $('decision').textContent = d.decision + (d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
     $('gridWatts').textContent = Math.abs(d.grid_w).toFixed(0) + ' W ' + (d.exporting ? 'exporting' : 'importing');
     $('gridFlow').className = 'flow-dot ' + (d.exporting ? 'flow-export' : 'flow-import');
+
+    $('batteryWatts').textContent = d.battery_w.toFixed(0) + ' W ' + d.battery_state;
+    if (d.surplus_excluded_w > 0) {
+      $('batteryExcludedNote').textContent = Math.round(d.surplus_excluded_w) + ' W excluded from surplus - home battery discharging';
+      $('batteryExcludedNote').style.display = '';
+    } else {
+      $('batteryExcludedNote').style.display = 'none';
+    }
 
     $('cpMode').innerHTML = badge(d.cp_mode_cls, d.cp_mode, d.cp_mode_title);
     $('cpDuty').innerHTML = badge(d.duty_cls, d.cp_duty, d.cp_duty_title);
@@ -570,6 +580,14 @@ static const char *build_status_json() {
     bool stale = !everPolled || (nowMs - s_last_solar_status.last_poll_success_ms >= STALE_DATA_TIMEOUT_MS);
 
     float surplusW = -s_last_solar_status.grid_power_w;
+    float batteryPowerW = s_last_solar_status.battery_power_w;
+    // How much of the raw surplus above is being excluded because it's
+    // attributable to the home battery discharging rather than PV - mirrors
+    // the fmaxf(0.0f, -batteryPowerW) adjustment solar_control_task applies
+    // before compute_next_target_amps() ever sees the reading.
+    float surplusExcludedW = fmaxf(0.0f, -batteryPowerW);
+    const char *batteryStateStr = (batteryPowerW < 0.0f) ? "discharging"
+                                    : (batteryPowerW > 0.0f) ? "charging" : "idle";
     uint32_t settleRemainingS = 0;
     if (s_last_decision == DECISION_SETTLING) {
         uint32_t elapsed = nowMs - s_last_lastChangeMs;
@@ -613,6 +631,9 @@ static const char *build_status_json() {
         "\"decision\":\"%s\","
         "\"grid_w\":%.0f,"
         "\"exporting\":%s,"
+        "\"battery_w\":%.0f,"
+        "\"battery_state\":\"%s\","
+        "\"surplus_excluded_w\":%.0f,"
         "\"settle_s\":%lu,"
         "\"target_a\":%.1f,"
         "\"target_w\":%.0f,"
@@ -642,6 +663,9 @@ static const char *build_status_json() {
         decision_reason_str(s_last_decision),
         fabsf(surplusW),
         surplusW >= 0 ? "true" : "false",
+        fabsf(batteryPowerW),
+        batteryStateStr,
+        surplusExcludedW,
         (unsigned long)settleRemainingS,
         s_last_target_amps,
         s_last_target_amps * s_last_mains_voltage_v,
@@ -865,6 +889,7 @@ void solar_control_task(void *pvParameters) {
             status.wifi_connected = (WiFi.status() == WL_CONNECTED);
             status.modbus_ok = false;
             status.grid_power_w = 0.0f;
+            status.battery_power_w = 0.0f;
             status.last_poll_success_ms = lastPollSuccessMs;
             status.schedule_active = scheduleActive;
             // Carried forward (not reset to 0) when inactive, so it ages
@@ -885,24 +910,42 @@ void solar_control_task(void *pvParameters) {
             if (status.wifi_connected) {
                 float gridPowerW;
                 float voltageV;
+                float batteryPowerW;
                 // currentDrawW is derived from the previous poll's voltage -
                 // this poll's own voltage isn't known until the read call
                 // below returns it. Negligible staleness, consistent with
                 // the rest of this loop's one-poll-delayed self-referential
                 // design.
                 float currentDrawW = targetAmps * s_last_mains_voltage_v;
-                if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV)) {
+                if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV, batteryPowerW)) {
                     status.modbus_ok = true;
                     status.grid_power_w = gridPowerW;
+                    status.battery_power_w = batteryPowerW;
                     lastPollSuccessMs = millis();
                     status.last_poll_success_ms = lastPollSuccessMs;
                     s_last_mains_voltage_v = voltageV;
+
+                    // Exclude home-battery discharge from what counts as
+                    // surplus for EV charging - the grid meter alone can't
+                    // tell "exporting because of fresh PV" apart from
+                    // "exporting because the home battery is discharging",
+                    // and diverting the latter into EV charging would mean
+                    // charging the car from the house battery instead of
+                    // solar. -batteryPowerW is positive exactly when
+                    // discharging; adding that magnitude back to gridPowerW
+                    // (negative when exporting) cancels its contribution to
+                    // apparent export. Battery charging (batteryPowerW > 0)
+                    // adds 0 here and is correctly left alone - that PV was
+                    // already consumed, not freed up. See grid_data_source.h's
+                    // outBatteryW doc comment and CLAUDE.md "Solar data
+                    // source".
+                    float effectiveGridPowerW = gridPowerW + fmaxf(0.0f, -batteryPowerW);
 
                     // Polling still runs (and still updates status/display)
                     // during a schedule window - it just stops feeding the
                     // control law while the schedule is in charge.
                     if (!scheduleActive) {
-                        s_last_decision = compute_next_target_amps(targetAmps, gridPowerW, now, lastChangeMs, targetAmps, voltageV);
+                        s_last_decision = compute_next_target_amps(targetAmps, effectiveGridPowerW, now, lastChangeMs, targetAmps, voltageV);
                         shared_state_set_target_amps(targetAmps);
                     }
                 }
