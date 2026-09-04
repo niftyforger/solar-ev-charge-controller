@@ -2,6 +2,9 @@
 
 Diverts surplus rooftop solar into EV charging by dynamically limiting the charge current a "dumb" (non-networked) EVSE offers to the car, based on real-time export data from a Sungrow hybrid inverter. The EVSE has no API or Modbus control path, so the only lever available is intercepting its Control Pilot (CP) signal to the car and clipping the duty cycle down when there isn't enough solar surplus to support the current it would otherwise offer.
 
+> **⚠️ Safety & Disclaimer**
+> This project modifies wiring in a vehicle charging circuit, adjacent to mains-connected equipment. Incorrect wiring or assembly can cause electric shock, fire, or damage to your vehicle or EVSE. It is not a certified product, has not been evaluated by any safety body, and may void your EVSE's warranty. Build and use it entirely at your own risk — see the [Safety model](#safety-model) section below for the fail-safe design rationale, and the [LICENSE](LICENSE) for the "AS IS" warranty disclaimer.
+
 For full pin assignments, register maps, timing/ISR design detail, and the fail-safe rationale, see [CLAUDE.md](CLAUDE.md).
 
 ## How it works
