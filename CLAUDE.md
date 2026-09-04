@@ -117,7 +117,7 @@ PlatformIO project, `env:freenove_esp32_s3_wroom`, framework `arduino`. Builds c
 - **Bench/night-time testing**: no separate "simulation mode" — the reactive simulated sources are picked from the same control-page grid-source dropdown as any real source, exercising the full poll/control-law/target-amps path (though stale-data fail-safe testing still needs real hardware, since a simulated source always succeeds).
 - **Control page**: `http://<device-ip>/`, HTTP Basic Auth (`admin` / `RuntimeConfig.web_password`, set via `SET WEB_PASS`, never `OTA_PASSWORD`). Refuses every request with 403 until a password has been committed at least once — no "open until first set" grace period, unlike WiFi, since this is network-reachable rather than a physical jumper. The interceptor's hardware topology already bounds what bad data here can do (clip down or fall back to native, never raise above native).
 
-Bench-tested through all three stages — real EVSE + real vehicle confirmed working 2026-09-04.
+Bench-tested through all three stages — real EVSE + real vehicle confirmed working 2026-09-04. Real EVSE is a Geely-branded Jueclat EV Charger-Lite, model WB-AC230-7-N-C-W/S-EU2.0 (single-phase 230V, 7kW, matching the "no API/Modbus/WiFi control path" assumption above).
 
 ## Bench testing & validation plan
 
@@ -126,7 +126,7 @@ All four stages complete and passed clean.
 0. **BLE provisioning — done.** Fresh-board bring-up: NVS erase, BLE advertises indefinitely while unprovisioned, `HELP`/`AUTH`/`SET`/`COMMIT` auth gating confirmed, `GET STATUS` never echoes a password, control page 403s before `WEB_PASS` is set, advertising window closes after first provision, OTA authenticates independently via `OTA_PASSWORD`.
 1. **CP simulator alone — done.** A bench oscillator (native PWM stand-in) + switchable diode/resistor network (vehicle CP termination stand-in, A/B/C, with/without the state diode) validated sensing accuracy, clamp timing, negative-half-cycle/STANDBY/handshake isolation, and clean relay open/close.
 2. **Real EVSE + CP simulator — done.** Comparator thresholds landed as expected; relay open/close mid-simulated-charge behaved as a normal unplug/replug — no fault code, current resumed ramping on reconnect.
-3. **Real EVSE + real vehicle — done, 2026-09-04, full success.** Live CP duty-cycle changes accepted mid-charge with no state-B blip needed; fail-safe and relay behavior matched stages 1-2; no faults observed.
+3. **Real EVSE + real vehicle — done, 2026-09-04, full success.** EVSE: Geely-branded Jueclat EV Charger-Lite, model WB-AC230-7-N-C-W/S-EU2.0. Live CP duty-cycle changes accepted mid-charge with no state-B blip needed; fail-safe and relay behavior matched stages 1-2; no faults observed.
 
 ## Open questions for implementation
 
