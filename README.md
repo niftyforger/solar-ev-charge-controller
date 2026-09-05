@@ -144,9 +144,7 @@ Bench-tested through all stages, including the real EVSE and a real vehicle (202
 
 Control page:
 
-| | |
-|---|---|
-| <img src="img/control_page_1.png" width="600" alt="Control page 1"> | <img src="img/control_page_2.png" width="600" alt="Control page 2"> |
+<p align="center"><img src="img/control_page_1.png" width="600" alt="Control page 1"></p>
 
 Bench setup:
 
