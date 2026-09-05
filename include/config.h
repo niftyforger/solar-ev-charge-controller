@@ -95,6 +95,14 @@
 #define HISTORY_BUCKET_SPAN_S      300   // 5 minutes per bucket
 #define HISTORY_BUCKET_CAPACITY    288   // 24h / 5min
 
+// Persists the history buffer to LittleFS (see solar_control.cpp's history_load_from_fs()/
+// history_save_to_fs()) so it survives reboots/reflashes. Bump HISTORY_FILE_VERSION whenever
+// HistoryBucket's layout changes - a mismatched magic/version/size on load is treated as "no
+// history" rather than misreading stale-format bytes.
+#define HISTORY_FILE_PATH          "/history.bin"
+#define HISTORY_FILE_MAGIC         0x48495354UL // "HIST"
+#define HISTORY_FILE_VERSION       1
+
 // BLE config server (WiFi SSID/password, inverter IP - see ble_config.cpp). Provisioned
 // entirely over BLE into NVS; no compile-time fallback (see CLAUDE.md "BLE configuration").
 #define BLE_DEVICE_NAME            "solar-ev-charger"
