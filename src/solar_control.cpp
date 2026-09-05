@@ -7,8 +7,10 @@
 #include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <math.h>
 #include <time.h>
+#include <string.h>
 
 // What the control law just did, kept alongside the numeric target so the
 // web UI can explain the decision in words instead of just showing a number.
@@ -208,10 +210,13 @@ static uint32_t s_last_lastChangeMs = 0;
 
 // Server-side power history for the control page's chart - a fixed ring of 5-minute
 // buckets (not raw per-poll samples) so every browser session sees the same rolling 24h
-// window instead of each tab reconstructing its own from /api/status polls. RAM-only,
-// resets on reboot - see CLAUDE.md/plan notes; no NVS persistence, matching the project's
-// pattern of only persisting user-driven settings, never periodic telemetry. Only ever
-// touched from solar_control_task (poll loop writes, HTTP handler reads), so no mutex.
+// window instead of each tab reconstructing its own from /api/status polls. Persisted to
+// LittleFS (history_load_from_fs()/history_save_to_fs() below) so it survives reboots and
+// reflashes - the buffer is loaded once at task start and the whole file is rewritten each
+// time a bucket completes (~288 writes/day), relying on LittleFS's wear leveling across the
+// otherwise-unused 1.5MB filesystem partition rather than a more complex append-only journal.
+// Only ever touched from solar_control_task (poll loop writes, HTTP handler reads), so no
+// mutex.
 struct HistoryBucket {
     uint32_t start_epoch_s;
     float target_sum_w;
@@ -220,6 +225,58 @@ struct HistoryBucket {
 };
 static HistoryBucket s_history[HISTORY_BUCKET_CAPACITY];
 static size_t s_history_created = 0; // total buckets ever started (monotonic)
+
+struct HistoryFileHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t history_created;
+};
+
+// Loads a previously-persisted history buffer, if any. Any failure (no filesystem, missing
+// file, wrong size, magic/version mismatch from an older firmware's HistoryBucket layout) is
+// treated as "no history" and silently leaves s_history/s_history_created at their
+// zero-initialized defaults - never blocks or fails boot over this.
+static void history_load_from_fs() {
+    if (!LittleFS.begin(true)) {
+        return;
+    }
+    File f = LittleFS.open(HISTORY_FILE_PATH, "r");
+    if (!f) {
+        return;
+    }
+    HistoryFileHeader header;
+    size_t expectedSize = sizeof(header) + sizeof(s_history);
+    if (f.size() != expectedSize ||
+        f.read(reinterpret_cast<uint8_t *>(&header), sizeof(header)) != sizeof(header) ||
+        header.magic != HISTORY_FILE_MAGIC || header.version != HISTORY_FILE_VERSION) {
+        f.close();
+        return;
+    }
+    if (f.read(reinterpret_cast<uint8_t *>(s_history), sizeof(s_history)) != sizeof(s_history)) {
+        f.close();
+        // Partial/corrupt read - don't trust a half-populated buffer.
+        memset(s_history, 0, sizeof(s_history));
+        return;
+    }
+    f.close();
+    s_history_created = header.history_created;
+}
+
+// Overwrites the persisted history file with the current buffer. Called only from the
+// bucket-rollover path (~once per 5 minutes), not per-poll, to keep flash writes infrequent.
+static void history_save_to_fs() {
+    File f = LittleFS.open(HISTORY_FILE_PATH, "w");
+    if (!f) {
+        return;
+    }
+    HistoryFileHeader header;
+    header.magic = HISTORY_FILE_MAGIC;
+    header.version = HISTORY_FILE_VERSION;
+    header.history_created = (uint32_t)s_history_created;
+    f.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+    f.write(reinterpret_cast<const uint8_t *>(s_history), sizeof(s_history));
+    f.close();
+}
 
 static WebServer s_web_server(SIM_HTTP_PORT);
 
@@ -949,6 +1006,7 @@ void solar_control_task(void *pvParameters) {
     uint32_t lastAppliedGeneration = cfg.generation;
     load_grid_source_from_nvs();
     load_schedule_from_nvs();
+    history_load_from_fs();
 
     connect_wifi(cfg);
     register_network_services();
@@ -1095,6 +1153,7 @@ void solar_control_task(void *pvParameters) {
                     cur->grid_sum_w = 0.0f;
                     cur->sample_count = 0;
                     s_history_created++;
+                    history_save_to_fs();
                 }
                 cur->target_sum_w += targetAmps * s_last_mains_voltage_v;
                 cur->grid_sum_w += status.grid_power_w;
