@@ -35,7 +35,7 @@
 
 static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
                                          float &outWatts, float &outVoltageV,
-                                         float &outBatteryW) {
+                                         float &outBatteryW, bool &outBatteryDataValid) {
     // Persistent connection reused across polls - only ever runs serially on Core 0's
     // solar_control_task, so a function-local static is safe.
     static ModbusTcpClient client(IPAddress(0, 0, 0, 0), SUNGROW_WINET_MODBUS_TCP_PORT,
@@ -64,9 +64,13 @@ static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
     outVoltageV = lastGoodVoltageV;
 
     // Battery power is secondary too, same reasoning - a miss only means this poll can't
-    // exclude battery discharge from surplus, never a safety issue. Falls back to the last
-    // known-good value, or 0.0f (assume no battery activity) if none yet.
+    // refresh the reading, never a safety issue on its own. Falls back to the last
+    // known-good value for display continuity, but outBatteryDataValid (below) tracks
+    // freshness explicitly so a stale/never-obtained reading can't silently masquerade as
+    // a confirmed-idle battery to the discharge-exclusion logic in solar_control.cpp.
     static float lastGoodBatteryW = 0.0f;
+    static bool batteryEverReadOk = false;
+    static uint32_t lastBatteryReadOkMs = 0;
     uint16_t batteryRegs[SUNGROW_WINET_REG_BATTERY_POWER_COUNT];
     if (client.readInputRegisters(SUNGROW_WINET_REG_BATTERY_POWER, SUNGROW_WINET_REG_BATTERY_POWER_COUNT, batteryRegs)) {
         int16_t rawBattery = (int16_t)batteryRegs[0];
@@ -78,12 +82,15 @@ static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
         // trusting it - same fallback-to-last-known-good treatment as a failed read above.
         if (fabsf(batteryReadingW) <= SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W) {
             lastGoodBatteryW = batteryReadingW;
+            batteryEverReadOk = true;
+            lastBatteryReadOkMs = millis();
         } else {
             Serial.printf("[modbus] battery_power_w %.0f exceeds sanity bound (%.0f), rejecting\n",
                           batteryReadingW, SUNGROW_WINET_BATTERY_POWER_SANITY_MAX_W);
         }
     }
     outBatteryW = lastGoodBatteryW;
+    outBatteryDataValid = batteryEverReadOk && (millis() - lastBatteryReadOkMs <= STALE_DATA_TIMEOUT_MS);
     return true;
 }
 

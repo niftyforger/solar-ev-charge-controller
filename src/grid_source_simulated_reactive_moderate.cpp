@@ -15,10 +15,11 @@ static const float SIMULATED_HOUSE_LOAD_W = 800.0f;
 
 static bool simulated_reactive_moderate_read_power_w(IPAddress /*host*/, float currentDrawW,
                                                         float &outWatts, float &outVoltageV,
-                                                        float &outBatteryW) {
+                                                        float &outBatteryW, bool &outBatteryDataValid) {
     outWatts = currentDrawW + SIMULATED_HOUSE_LOAD_W - SIMULATED_PV_CAPACITY_W; // negative = exporting
     outVoltageV = MAINS_VOLTAGE_FIXED_V;
     outBatteryW = 0.0f; // no battery modeled
+    outBatteryDataValid = true; // "no battery" is itself a known, trustworthy state
     return true;
 }
 

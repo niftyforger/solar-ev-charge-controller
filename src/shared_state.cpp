@@ -4,7 +4,19 @@
 QueueHandle_t g_target_amps_queue = nullptr;
 
 static SemaphoreHandle_t s_status_mutex = nullptr;
-static SolarStatus s_solar_status = {0.0f, 0, false, false};
+// Explicit field-by-field (not relying on trailing zero-fill) since SolarStatus has grown
+// enough fields that positional init is easy to miscount - battery_data_valid defaults to
+// false (unknown/not yet valid) until the first successful poll says otherwise.
+static SolarStatus s_solar_status = {
+    0.0f,  // grid_power_w
+    0.0f,  // battery_power_w
+    false, // battery_data_valid
+    0,     // last_poll_success_ms
+    false, // wifi_connected
+    false, // modbus_ok
+    false, // schedule_active
+    0,     // last_schedule_confirm_ms
+};
 static CpStatus s_cp_status = {MODE_BYPASS, CP_STANDBY, CONN_STATE_FAULT, 0.0f, 0.0f};
 static volatile uint32_t s_solar_task_heartbeat_ms = 0;
 static RuntimeConfig s_runtime_config = {{0}, {0}, {0}, false, 0, {0}, {0}};

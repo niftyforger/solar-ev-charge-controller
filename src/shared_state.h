@@ -26,6 +26,11 @@ enum ConnectorState {
 struct SolarStatus {
     float grid_power_w;          // negative = exporting
     float battery_power_w;       // positive = charging, negative = discharging, 0 = idle/no battery
+    // False whenever battery_power_w can't be trusted for the discharge-exclusion
+    // calculation - never yet read, or the source's own reading has gone stale/been
+    // rejected - so a real discharge that isn't being measured can't silently look like a
+    // confirmed-idle battery. See grid_data_source.h's outBatteryDataValid doc comment.
+    bool battery_data_valid;
     uint32_t last_poll_success_ms;
     bool wifi_connected;
     bool modbus_ok;

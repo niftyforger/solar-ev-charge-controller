@@ -19,9 +19,18 @@
 // the point of reference" convention as the grid reading). Lets solar_control_task exclude
 // battery-discharge power from EV-charging surplus, since grid power alone can't tell
 // fresh-PV export from battery-discharge export. A source with no battery just reports 0.0f.
+//
+// outBatteryDataValid reports whether outBatteryW is fresh enough to trust for that
+// exclusion - false on a source that has never yet obtained a real battery reading, or
+// whose reading has gone stale (a failed/rejected register read silently reusing a stale
+// last-known value would otherwise look identical to a confirmed-idle battery, defeating
+// the exclusion exactly when it matters). A source with no battery just reports true
+// unconditionally - "no battery" is itself a known, trustworthy state.
+//
 // Returns true on success.
 typedef bool (*GridDataSourceReadFn)(IPAddress host, float currentDrawW, float &outWatts,
-                                       float &outVoltageV, float &outBatteryW);
+                                       float &outVoltageV, float &outBatteryW,
+                                       bool &outBatteryDataValid);
 
 struct GridDataSource {
     // Short, stable machine key (e.g. "sungrow_winet") - persisted to NVS as the selected
