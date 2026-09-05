@@ -89,6 +89,12 @@
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
 #define WIFI_HOSTNAME              "solar-ev-charger"
 
+// Server-side power-history rolling buffer for the control page's chart (see
+// /api/history in solar_control.cpp) - fixed-size ring of time buckets, not raw
+// per-poll samples, so 24h of history costs a few KB instead of needing PSRAM.
+#define HISTORY_BUCKET_SPAN_S      300   // 5 minutes per bucket
+#define HISTORY_BUCKET_CAPACITY    288   // 24h / 5min
+
 // BLE config server (WiFi SSID/password, inverter IP - see ble_config.cpp). Provisioned
 // entirely over BLE into NVS; no compile-time fallback (see CLAUDE.md "BLE configuration").
 #define BLE_DEVICE_NAME            "solar-ev-charger"
