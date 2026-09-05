@@ -13,11 +13,12 @@ static const float SIMULATED_BATTERY_DISCHARGE_W = 7400.0f; // battery covers lo
 
 static bool simulated_reactive_battery_discharge_read_power_w(IPAddress /*host*/, float currentDrawW,
                                                                  float &outWatts, float &outVoltageV,
-                                                                 float &outBatteryW) {
+                                                                 float &outBatteryW, bool &outBatteryDataValid) {
     // Battery discharge behaves like extra "PV" from the grid meter's point of view.
     outWatts = currentDrawW + SIMULATED_HOUSE_LOAD_W - SIMULATED_PV_CAPACITY_W - SIMULATED_BATTERY_DISCHARGE_W;
     outVoltageV = MAINS_VOLTAGE_FIXED_V;
     outBatteryW = -SIMULATED_BATTERY_DISCHARGE_W; // negative = discharging
+    outBatteryDataValid = true; // simulated reading is always fresh by construction
     return true;
 }
 

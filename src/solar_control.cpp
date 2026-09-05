@@ -43,7 +43,8 @@ static const char *decision_reason_str(ControlDecision d) {
 // doesn't fight its own effect on the next poll.
 static ControlDecision compute_next_target_amps(float currentTargetA, float gridPowerW,
                                                   uint32_t nowMs, uint32_t &lastChangeMs,
-                                                  float &outTargetA, float mainsVoltageV) {
+                                                  float &outTargetA, float mainsVoltageV,
+                                                  bool batteryDataValid) {
     if (nowMs - lastChangeMs < SETTLE_MS) {
         outTargetA = currentTargetA;
         return DECISION_SETTLING;
@@ -56,6 +57,13 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
     // rate. rawTargetA is the exact amps the current surplus supports, even from a cold
     // start - a large surplus reaches equilibrium in one settled poll, not the floor first.
     float deltaA = surplusW / mainsVoltageV;
+    // gridPowerW is already battery-discharge-excluded (see call site), but that exclusion
+    // is only trustworthy when the battery reading behind it is fresh. When it isn't, never
+    // increase the target on unverified data - holding or backing off is always safe, but an
+    // increase could secretly be drawing on undetected battery discharge.
+    if (!batteryDataValid) {
+        deltaA = fminf(deltaA, 0.0f);
+    }
     float rawTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
 
     // Mirrors cp_interceptor.cpp's own STANDBY/OSCILLATING thresholds: bare
@@ -442,6 +450,7 @@ select{width:100%}
         <div class="kv"><span>Grid voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="batteryExcludedNote" class="stat-sub" style="display:none"></div>
+        <div id="batteryStaleNote" class="stat-sub" style="display:none;color:var(--bad)">Battery data unavailable/stale - target amps on hold (can decrease, won't increase) until it's confirmed fresh</div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
           Data is stale &mdash; CP will fail safe to native pass-through.
         </div>
@@ -644,6 +653,7 @@ select{width:100%}
     } else {
       $('batteryExcludedNote').style.display = 'none';
     }
+    $('batteryStaleNote').style.display = d.battery_data_valid ? 'none' : '';
 
     $('cpMode').innerHTML = badge(d.cp_mode_cls, d.cp_mode, d.cp_mode_title);
     $('cpDuty').innerHTML = badge(d.duty_cls, d.cp_duty, d.cp_duty_title);
@@ -762,6 +772,7 @@ static const char *build_status_json() {
     float surplusExcludedW = fmaxf(0.0f, -batteryPowerW);
     const char *batteryStateStr = (batteryPowerW < 0.0f) ? "discharging"
                                     : (batteryPowerW > 0.0f) ? "charging" : "idle";
+    bool batteryDataValid = s_last_solar_status.battery_data_valid;
     uint32_t settleRemainingS = 0;
     if (s_last_decision == DECISION_SETTLING) {
         uint32_t elapsed = nowMs - s_last_lastChangeMs;
@@ -807,6 +818,7 @@ static const char *build_status_json() {
         "\"exporting\":%s,"
         "\"battery_w\":%.0f,"
         "\"battery_state\":\"%s\","
+        "\"battery_data_valid\":%s,"
         "\"surplus_excluded_w\":%.0f,"
         "\"settle_s\":%lu,"
         "\"target_a\":%.1f,"
@@ -839,6 +851,7 @@ static const char *build_status_json() {
         surplusW >= 0 ? "true" : "false",
         fabsf(batteryPowerW),
         batteryStateStr,
+        batteryDataValid ? "true" : "false",
         surplusExcludedW,
         (unsigned long)settleRemainingS,
         s_last_target_amps,
@@ -1079,6 +1092,7 @@ void solar_control_task(void *pvParameters) {
             status.modbus_ok = false;
             status.grid_power_w = 0.0f;
             status.battery_power_w = 0.0f;
+            status.battery_data_valid = s_last_solar_status.battery_data_valid;
             status.last_poll_success_ms = lastPollSuccessMs;
             status.schedule_active = scheduleActive;
             // Carried forward (not reset to 0) when inactive, so it ages
@@ -1100,13 +1114,15 @@ void solar_control_task(void *pvParameters) {
                 float gridPowerW;
                 float voltageV;
                 float batteryPowerW;
+                bool batteryDataValid;
                 // Derived from the previous poll's voltage - this poll's own voltage isn't
                 // known until the read call below returns it; negligible staleness.
                 float currentDrawW = targetAmps * s_last_mains_voltage_v;
-                if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV, batteryPowerW)) {
+                if (s_active_grid_source->read_power_w(inverterIp, currentDrawW, gridPowerW, voltageV, batteryPowerW, batteryDataValid)) {
                     status.modbus_ok = true;
                     status.grid_power_w = gridPowerW;
                     status.battery_power_w = batteryPowerW;
+                    status.battery_data_valid = batteryDataValid;
                     lastPollSuccessMs = millis();
                     status.last_poll_success_ms = lastPollSuccessMs;
                     s_last_mains_voltage_v = voltageV;
@@ -1123,7 +1139,7 @@ void solar_control_task(void *pvParameters) {
                     // during a schedule window - it just stops feeding the
                     // control law while the schedule is in charge.
                     if (!scheduleActive) {
-                        s_last_decision = compute_next_target_amps(targetAmps, effectiveGridPowerW, now, lastChangeMs, targetAmps, voltageV);
+                        s_last_decision = compute_next_target_amps(targetAmps, effectiveGridPowerW, now, lastChangeMs, targetAmps, voltageV, batteryDataValid);
                         shared_state_set_target_amps(targetAmps);
                     }
                 }
