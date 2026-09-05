@@ -19,9 +19,13 @@
 #define SUNGROW_WINET_GRID_VOLTAGE_SCALE     0.1f
 // Standalone S16 (not the low half of a 13021-13022 S32 pair - that assumption gave a
 // garbage 58M W reading; corrected 2026-09-04 against real battery discharge, see
-// CLAUDE.md "Resolved"). Raw is already positive=charging/negative=discharging - the same
-// convention outBatteryW uses - so it's passed through unmodified, unlike SUNGROW_WINET_REG_GRID_POWER
-// above (fixed 2026-09-05 after a real grid-scheduled charge showed up as "discharging").
+// CLAUDE.md "Resolved"). Raw is positive=discharging/negative=charging - opposite of the
+// positive=charging/negative=discharging convention outBatteryW uses - so it's negated
+// here, the same as SUNGROW_WINET_REG_GRID_POWER above. (A same-day 2026-09-05 change
+// briefly dropped this negation based on an indirect inference from a grid-import spike;
+// reverted later the same day after a directly Sungrow-app-confirmed discharge showed up
+// as "charging" - the mirror image of the bug that change was meant to fix. Every direct
+// app observation, on both 2026-09-04 and 2026-09-05, matches the negated reading.)
 #define SUNGROW_WINET_REG_BATTERY_POWER      13021
 #define SUNGROW_WINET_REG_BATTERY_POWER_COUNT 1
 // Generous bound, well above any residential pack's real power - only guards against a
@@ -66,7 +70,7 @@ static bool sungrow_winet_read_power_w(IPAddress host, float /*currentDrawW*/,
     uint16_t batteryRegs[SUNGROW_WINET_REG_BATTERY_POWER_COUNT];
     if (client.readInputRegisters(SUNGROW_WINET_REG_BATTERY_POWER, SUNGROW_WINET_REG_BATTERY_POWER_COUNT, batteryRegs)) {
         int16_t rawBattery = (int16_t)batteryRegs[0];
-        float batteryReadingW = (float)rawBattery;
+        float batteryReadingW = -(float)rawBattery;
         Serial.printf("[modbus] batteryRegs[0]=0x%04X raw=%d battery_power_w=%.0f (%s)\n",
                       batteryRegs[0], rawBattery, batteryReadingW,
                       batteryReadingW < 0 ? "discharging" : (batteryReadingW > 0 ? "charging" : "idle"));
