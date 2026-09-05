@@ -206,6 +206,21 @@ static float s_last_target_amps = 0.0f;
 static ControlDecision s_last_decision = DECISION_HOLD;
 static uint32_t s_last_lastChangeMs = 0;
 
+// Server-side power history for the control page's chart - a fixed ring of 5-minute
+// buckets (not raw per-poll samples) so every browser session sees the same rolling 24h
+// window instead of each tab reconstructing its own from /api/status polls. RAM-only,
+// resets on reboot - see CLAUDE.md/plan notes; no NVS persistence, matching the project's
+// pattern of only persisting user-driven settings, never periodic telemetry. Only ever
+// touched from solar_control_task (poll loop writes, HTTP handler reads), so no mutex.
+struct HistoryBucket {
+    uint32_t start_epoch_s;
+    float target_sum_w;
+    float grid_sum_w;
+    uint16_t sample_count;
+};
+static HistoryBucket s_history[HISTORY_BUCKET_CAPACITY];
+static size_t s_history_created = 0; // total buckets ever started (monotonic)
+
 static WebServer s_web_server(SIM_HTTP_PORT);
 
 // web_password is set entirely over BLE (SET WEB_PASS, ble_config.cpp) - never
@@ -331,6 +346,12 @@ select{width:100%}
 .field label{display:block;color:var(--text-muted);margin-bottom:6px}
 .watts-input-group{display:flex;gap:8px}
 .watts-input-group input[type=number]{flex:1;min-width:0}
+#historyCard{grid-column:1/-1}
+#historyChart{display:block;width:100%;height:220px}
+.chart-legend{display:flex;gap:16px;margin-top:8px;font-size:.8rem;color:var(--text-muted)}
+.chart-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.dot-target{background:var(--accent)}
+.dot-grid{background:var(--warn)}
 </style>
 </head>
 <body>
@@ -345,13 +366,9 @@ select{width:100%}
   <div id="dashboard" style="display:none">
     <div class="grid">
       <section class="card">
-        <h2>Target power</h2>
+        <h2>Charge point</h2>
         <div class="stat-value"><span id="targetWatts">-- W</span> <span class="stat-value-sub" id="targetAmps">(-- A)</span></div>
         <div class="stat-sub" id="decision">Loading&hellip;</div>
-      </section>
-
-      <section class="card">
-        <h2>Charge point</h2>
         <div class="kv"><span>Solar control</span><span id="cpMode">--</span></div>
         <div class="kv"><span>Charging status</span><span id="cpDuty">--</span></div>
         <div class="kv"><span>Connector</span><span id="connector">--</span></div>
@@ -363,7 +380,7 @@ select{width:100%}
           <select id="sourceSelect"></select>
           <div class="stat-sub" id="pollFailedNote" style="display:none;color:var(--bad)">Last poll failed</div>
         </div>
-        <div class="kv"><span>Power</span><span><span class="flow-dot" id="gridFlow" style="display:inline-block;vertical-align:middle;margin-right:6px"></span><span id="gridWatts">--</span></span></div>
+        <div class="kv"><span>Grid Power</span><span><span class="flow-dot" id="gridFlow" style="display:inline-block;vertical-align:middle;margin-right:6px"></span><span id="gridWatts">--</span></span></div>
         <div class="kv"><span>Battery</span><span id="batteryWatts">--</span></div>
         <div class="kv"><span>Grid voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
@@ -396,6 +413,15 @@ select{width:100%}
         </div>
         <div id="timeSyncWarn" class="stat-sub" style="display:none;color:var(--warn)">Waiting for time sync&hellip;</div>
       </section>
+
+      <section class="card" id="historyCard">
+        <h2>Power history</h2>
+        <canvas id="historyChart"></canvas>
+        <div class="chart-legend">
+          <span><i class="dot dot-target"></i>Target</span>
+          <span><i class="dot dot-grid"></i>Grid</span>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -425,6 +451,126 @@ select{width:100%}
   var SCHEDULE_FIELD_IDS = ['scheduleEnabled', 'scheduleStart', 'scheduleEnd', 'scheduleAmps'];
   function scheduleFieldFocused(){
     return SCHEDULE_FIELD_IDS.indexOf(document.activeElement && document.activeElement.id) !== -1;
+  }
+
+  // Populated from /api/history (see fetchHistory below) - the device itself owns this
+  // rolling window so every browser session shows the same data, not a per-tab
+  // reconstruction from /api/status polls.
+  var history = [];
+
+  function fetchHistory(){
+    fetch('/api/history', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(d){
+      history = d.points.map(function(p){
+        return {t: p.t * 1000, target: p.target_w, grid: p.grid_w};
+      });
+      drawChart();
+    }).catch(function(){});
+  }
+
+  function drawChart(){
+    var canvas = $('historyChart');
+    var cssWidth = canvas.clientWidth, cssHeight = canvas.clientHeight;
+    if (cssWidth === 0 || cssHeight === 0) { return; }
+    var dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+      canvas.width = Math.round(cssWidth * dpr);
+      canvas.height = Math.round(cssHeight * dpr);
+    }
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    if (history.length === 0) { return; }
+
+    var style = getComputedStyle(document.documentElement);
+    var accentColor = style.getPropertyValue('--accent').trim();
+    var warnColor = style.getPropertyValue('--warn').trim();
+    var borderColor = style.getPropertyValue('--border').trim();
+
+    var textMutedColor = style.getPropertyValue('--text-muted').trim();
+
+    var values = [0];
+    for (var i = 0; i < history.length; i++) {
+      values.push(history[i].target, history[i].grid);
+    }
+    var min = Math.min.apply(null, values);
+    var max = Math.max.apply(null, values);
+    if (min === max) { min -= 100; max += 100; }
+
+    function niceStep(rawStep){
+      var mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      var f = rawStep / mag;
+      var niceF = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
+      return niceF * mag;
+    }
+    var step = niceStep((max - min) / 5);
+    var niceMin = Math.floor(min / step) * step;
+    var niceMax = Math.ceil(max / step) * step;
+
+    var tMin = history[0].t, tMax = history[history.length - 1].t;
+    if (tMax === tMin) { tMax = tMin + 1; }
+
+    var marginLeft = 52, marginRight = 12, marginTop = 8, marginBottom = 26;
+    var plotLeft = marginLeft, plotRight = cssWidth - marginRight;
+    var plotTop = marginTop, plotBottom = cssHeight - marginBottom;
+    var plotWidth = plotRight - plotLeft, plotHeight = plotBottom - plotTop;
+
+    function xOf(t){ return plotLeft + (t - tMin) / (tMax - tMin) * plotWidth; }
+    function yOf(v){ return plotBottom - (v - niceMin) / (niceMax - niceMin) * plotHeight; }
+
+    ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+
+    // Y-axis: nice-number gridlines/labels. niceMin/niceMax are exact multiples of
+    // step spanning the (always-included-via `values=[0]`) zero point, so 0 always
+    // lands on a tick here - no separate zero-reference-line special case needed.
+    ctx.lineWidth = 1;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right';
+    for (var tick = niceMin; tick <= niceMax + 1e-9; tick += step) {
+      var y = yOf(tick);
+      ctx.strokeStyle = borderColor;
+      ctx.beginPath();
+      ctx.moveTo(plotLeft, y);
+      ctx.lineTo(plotRight, y);
+      ctx.stroke();
+      ctx.fillStyle = textMutedColor;
+      ctx.fillText(Math.round(tick).toLocaleString() + ' W', plotLeft - 6, y);
+    }
+
+    // X-axis: evenly spaced ticks across the actual retained time span - not
+    // snapped to calendar boundaries, since history can span minutes or a full
+    // 24h. Skipped entirely with <2 points (nothing meaningful yet after boot).
+    if (history.length >= 2) {
+      var xTickCount = 5;
+      ctx.textBaseline = 'top';
+      for (var k = 0; k < xTickCount; k++) {
+        var tickT = tMin + k * (tMax - tMin) / (xTickCount - 1);
+        var x = xOf(tickT);
+        ctx.strokeStyle = borderColor;
+        ctx.beginPath();
+        ctx.moveTo(x, plotBottom);
+        ctx.lineTo(x, plotBottom + 4);
+        ctx.stroke();
+        ctx.textAlign = (k === 0) ? 'left' : (k === xTickCount - 1) ? 'right' : 'center';
+        var d = new Date(tickT);
+        ctx.fillStyle = textMutedColor;
+        ctx.fillText(pad2(d.getHours()) + ':' + pad2(d.getMinutes()), x, plotBottom + 6);
+      }
+    }
+
+    function drawSeries(key, color){
+      if (history.length < 2) { return; }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (var j = 0; j < history.length; j++) {
+        var x = xOf(history[j].t), y = yOf(history[j][key]);
+        if (j === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+      }
+      ctx.stroke();
+    }
+    drawSeries('target', accentColor);
+    drawSeries('grid', warnColor);
   }
 
   function render(d){
@@ -467,6 +613,8 @@ select{width:100%}
     }
     $('scheduleActiveBadge').innerHTML = d.schedule_active ? badge('ok', 'Active now') : '';
     $('timeSyncWarn').style.display = d.time_synced ? 'none' : '';
+
+    drawChart();
   }
 
   function showError(msg){
@@ -502,8 +650,11 @@ select{width:100%}
         + '&amps=' + encodeURIComponent($('scheduleAmps').value);
       applyAndRender(url);
     });
+    window.addEventListener('resize', drawChart);
     poll();
     setInterval(poll, 5000);
+    fetchHistory();
+    setInterval(fetchHistory, 30000);
   });
 })();
 </script>
@@ -723,6 +874,38 @@ static void handle_api_set_schedule() {
     s_web_server.send(200, "application/json", build_status_json());
 }
 
+// File-scope for the same reason as s_json_body above. Sized for
+// HISTORY_BUCKET_CAPACITY points at ~45 bytes/point plus overhead.
+static char s_history_json_body[16384];
+
+static const char *build_history_json() {
+    size_t offset = snprintf(s_history_json_body, sizeof(s_history_json_body),
+        "{\"bucket_span_s\":%d,\"points\":[", HISTORY_BUCKET_SPAN_S);
+
+    size_t count = (s_history_created < HISTORY_BUCKET_CAPACITY) ? s_history_created : HISTORY_BUCKET_CAPACITY;
+    size_t oldest = s_history_created - count;
+    for (size_t i = 0; i < count && offset < sizeof(s_history_json_body); i++) {
+        const HistoryBucket &b = s_history[(oldest + i) % HISTORY_BUCKET_CAPACITY];
+        offset += snprintf(s_history_json_body + offset, sizeof(s_history_json_body) - offset,
+            "%s{\"t\":%lu,\"target_w\":%.0f,\"grid_w\":%.0f}",
+            (i == 0) ? "" : ",",
+            (unsigned long)b.start_epoch_s,
+            b.target_sum_w / b.sample_count,
+            b.grid_sum_w / b.sample_count);
+    }
+    if (offset < sizeof(s_history_json_body)) {
+        offset += snprintf(s_history_json_body + offset, sizeof(s_history_json_body) - offset, "]}");
+    }
+    return s_history_json_body;
+}
+
+static void handle_api_history() {
+    if (!require_auth()) {
+        return;
+    }
+    s_web_server.send(200, "application/json", build_history_json());
+}
+
 // Route/callback registration: WebServer::on() appends to an internal linked list every
 // call rather than replacing, so this must run exactly once for the process lifetime -
 // repeating it on reconnect would leak a handler. Safe before WiFi/services are up; only
@@ -738,6 +921,7 @@ static void register_network_services() {
     s_web_server.on("/api/status", HTTP_GET, handle_api_status);
     s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
     s_web_server.on("/api/set_schedule", HTTP_GET, handle_api_set_schedule);
+    s_web_server.on("/api/history", HTTP_GET, handle_api_history);
 }
 
 // Rebinds ArduinoOTA's UDP listener and the WebServer's TCP listener to whatever WiFi
@@ -891,6 +1075,31 @@ void solar_control_task(void *pvParameters) {
             s_last_solar_status = status;
             s_last_target_amps = targetAmps;
             s_last_lastChangeMs = lastChangeMs;
+
+            // Only record a real reading, never a synthetic zero from a WiFi/Modbus outage
+            // or a pre-NTP-sync boot - an outage then shows as an honest time gap between
+            // two real points on the chart, not a misleading dip to zero.
+            if (timeSynced && status.modbus_ok) {
+                uint32_t nowEpoch = (uint32_t)time(nullptr);
+                uint32_t bucketStartEpoch = nowEpoch - (nowEpoch % HISTORY_BUCKET_SPAN_S);
+                bool needNewBucket = (s_history_created == 0);
+                HistoryBucket *cur = nullptr;
+                if (!needNewBucket) {
+                    cur = &s_history[(s_history_created - 1) % HISTORY_BUCKET_CAPACITY];
+                    needNewBucket = (cur->start_epoch_s != bucketStartEpoch);
+                }
+                if (needNewBucket) {
+                    cur = &s_history[s_history_created % HISTORY_BUCKET_CAPACITY];
+                    cur->start_epoch_s = bucketStartEpoch;
+                    cur->target_sum_w = 0.0f;
+                    cur->grid_sum_w = 0.0f;
+                    cur->sample_count = 0;
+                    s_history_created++;
+                }
+                cur->target_sum_w += targetAmps * s_last_mains_voltage_v;
+                cur->grid_sum_w += status.grid_power_w;
+                cur->sample_count++;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(250));
