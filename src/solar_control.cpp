@@ -450,7 +450,7 @@ select{width:100%}
         <div class="kv"><span>Grid voltage</span><span id="voltageDisplay">--</span></div>
         <div class="kv"><span>Last poll</span><span id="pollAge">--</span></div>
         <div id="batteryExcludedNote" class="stat-sub" style="display:none"></div>
-        <div id="batteryStaleNote" class="stat-sub" style="display:none;color:var(--bad)">Battery data unavailable/stale - target amps on hold (can decrease, won't increase) until it's confirmed fresh</div>
+        <div id="batteryStaleNote" class="stat-sub" style="display:none;color:var(--bad)">Battery reading unavailable, stale, or of unknown direction - target amps on hold (can decrease, won't increase) until it's confirmed fresh</div>
         <div id="staleWarn" class="banner banner-warn" style="display:none;margin:12px 0 0">
           Data is stale &mdash; CP will fail safe to native pass-through.
         </div>
@@ -770,9 +770,13 @@ static const char *build_status_json() {
     // the fmaxf(0.0f, -batteryPowerW) adjustment solar_control_task applies
     // before compute_next_target_amps() ever sees the reading.
     float surplusExcludedW = fmaxf(0.0f, -batteryPowerW);
-    const char *batteryStateStr = (batteryPowerW < 0.0f) ? "discharging"
-                                    : (batteryPowerW > 0.0f) ? "charging" : "idle";
     bool batteryDataValid = s_last_solar_status.battery_data_valid;
+    // "unknown" ahead of the sign test so an untrusted reading is never rendered as a
+    // confident direction - the direction is derived from a separate register that can
+    // fail or read ambiguously on its own (see grid_source_sungrow_winet.cpp).
+    const char *batteryStateStr = !batteryDataValid ? "unknown"
+                                    : (batteryPowerW < 0.0f) ? "discharging"
+                                    : (batteryPowerW > 0.0f) ? "charging" : "idle";
     uint32_t settleRemainingS = 0;
     if (s_last_decision == DECISION_SETTLING) {
         uint32_t elapsed = nowMs - s_last_lastChangeMs;
@@ -1091,7 +1095,10 @@ void solar_control_task(void *pvParameters) {
             status.wifi_connected = (WiFi.status() == WL_CONNECTED);
             status.modbus_ok = false;
             status.grid_power_w = 0.0f;
-            status.battery_power_w = 0.0f;
+            // Carried forward alongside battery_data_valid below, rather than reset - a
+            // dropped poll doesn't mean the battery went idle, and zeroing it here would
+            // render a confident "0 W idle" while validity still said the reading was good.
+            status.battery_power_w = s_last_solar_status.battery_power_w;
             status.battery_data_valid = s_last_solar_status.battery_data_valid;
             status.last_poll_success_ms = lastPollSuccessMs;
             status.schedule_active = scheduleActive;
