@@ -61,6 +61,14 @@ extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_HIGH;
 // showing a large export.
 extern const GridDataSource GRID_SOURCE_SIMULATED_REACTIVE_BATTERY_DISCHARGE;
 
+// Models measurement lag (vehicle current ramp + meter/register transport delay) and
+// cloud-driven surplus variation on top of the reactive model above. The rest of the
+// family reflects currentDrawW back instantaneously and noise-free, which is the one case
+// a deadbeat control law is unconditionally stable against - so this is the only source
+// that can reproduce the loop's lag-induced oscillation, and the regression test for the
+// damping that fixes it. See its .cpp and CLAUDE.md "Control-loop damping".
+extern const GridDataSource GRID_SOURCE_SIMULATED_LAGGED_CLOUDY;
+
 // All sources compiled into this build, selectable at runtime from the HTTP control page,
 // not a compile-time #define. Index 0 is the default/fallback source.
 extern const GridDataSource *const GRID_SOURCE_REGISTRY[];
