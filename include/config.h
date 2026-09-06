@@ -85,9 +85,53 @@
 // Core 0 solar control loop
 #define POLL_INTERVAL_MS          5000UL
 #define STALE_DATA_TIMEOUT_MS     60000UL
-#define SETTLE_MS                 15000UL
 #define WIFI_RECONNECT_INTERVAL_MS 5000UL
 #define WIFI_HOSTNAME              "solar-ev-charger"
+
+// Control-loop damping against measurement lag (see CLAUDE.md "Control-loop damping").
+// These are compile-time DEFAULTS only - all five are runtime-tunable from the HTTP
+// control page and persisted in the "control" NVS namespace (see ControlTuning in
+// solar_control.cpp), because the right values depend on this install's actual inverter
+// and vehicle lag, which can only be measured against real weather.
+//
+// Together they replaced the old single SETTLE_MS window, which gated reaction rate but
+// filtered nothing: one instantaneous sample drove a full-magnitude correction.
+
+// Blanking phase. Readings taken this soon after an accepted target change still show the
+// plant's PREVIOUS operating point (the meter/inverter register cadence plus the vehicle's
+// own current ramp) and are DISCARDED, not averaged in - folding them into the mean biases
+// it toward the pre-ramp, apparently-larger surplus and makes the oscillation worse, not
+// better. Wall-clock, because this models a physical settling time.
+#define CONTROL_BLANK_MS_DEFAULT     10000UL
+
+// Averaging phase: decide on the mean of this many successful readings instead of one
+// instantaneous sample. A COUNT rather than a time window, because averaging is a
+// statistical operation - a time window overlapping two failed Modbus polls would decide
+// on one sample or none, which is exactly the aliasing being removed. A dropped poll just
+// stretches the wall clock instead.
+#define CONTROL_AVG_SAMPLES_DEFAULT  3
+
+// Loop gain, applied to an INCREASE only. The law stays an integrator (target += g x
+// error), so any 0<g<1 still converges on the exact surplus with zero steady-state error -
+// which is what makes this a damping term and NOT the per-step cap that was removed
+// earlier (a cap is a fixed rate limit that bites just as hard when the plant is fully
+// settled). With one decision-period of unabsorbed lag the error poles have magnitude
+// sqrt(g): g=1 is exactly marginally stable (an undamped ~6-decision ring), g=0.7 decays
+// ~16% per decision. Decreases keep full gain - down is always the safe direction.
+// Never exceed 1.0: g>1 is unconditionally unstable.
+#define CONTROL_GAIN_UP_DEFAULT      0.7f
+
+// Corrections smaller than this neither move the target nor restart the blanking window.
+// Above the ~0.3A (MIN_CLAMP_MARGIN_PCT x 0.6 A/%) that cp_interceptor.cpp refuses to
+// re-arm the clamp for, so every accepted change is one the hardware actually applies -
+// previously a 0.05A nudge that changed nothing physically still cost a full settle window.
+#define CONTROL_DEADBAND_A_DEFAULT   0.5f
+
+// Fast-drop path: a single reading showing at least this much grid import cuts current
+// immediately at full gain, bypassing both phases above, so averaging only ever delays
+// increases. 2.0A = ~480W at 240V - clear of meter noise and of HYSTERESIS_A, so a fire
+// always produces a real change.
+#define CONTROL_FAST_DROP_A_DEFAULT  2.0f
 
 // Server-side power-history rolling buffer for the control page's chart (see
 // /api/history in solar_control.cpp) - fixed-size ring of time buckets, not raw

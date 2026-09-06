@@ -16,20 +16,27 @@
 // What the control law just did, kept alongside the numeric target so the
 // web UI can explain the decision in words instead of just showing a number.
 enum ControlDecision {
-    DECISION_SETTLING,     // still inside the settle window from the last change
+    DECISION_BLANKING,     // inside the blanking window - readings discarded, not averaged
+    DECISION_AVERAGING,    // past blanking, still collecting samples for the mean
     DECISION_STEP_UP,      // surplus supports more current, stepped up
     DECISION_STEP_DOWN,    // surplus dropped, stepped down
+    DECISION_FAST_DROP,    // real import seen - cut immediately, skipping both windows
     DECISION_HOLD,         // already matched to surplus, no change needed
     DECISION_CAPPED_MAX,   // would go higher, but MAX_CURRENT_A is the ceiling
     DECISION_CAPPED_ZERO,  // no surplus at all, held at the floor
     DECISION_SCHEDULE_OVERRIDE, // fixed-current schedule window active - solar reading ignored
 };
 
+// Keep every string at or under the length of the longest one below (the
+// SCHEDULE_OVERRIDE line, 57 chars) - build_status_json()'s worst-case size accounting
+// assumes it, and that buffer truncates silently.
 static const char *decision_reason_str(ControlDecision d) {
     switch (d) {
-        case DECISION_SETTLING:    return "Holding - settling after last change";
+        case DECISION_BLANKING:    return "Holding - waiting for the last change to reach the meter";
+        case DECISION_AVERAGING:   return "Sampling - averaging surplus before the next change";
         case DECISION_STEP_UP:     return "Increasing - surplus supports more current";
         case DECISION_STEP_DOWN:   return "Decreasing - surplus dropped";
+        case DECISION_FAST_DROP:   return "Decreasing now - grid import detected, cutting early";
         case DECISION_CAPPED_MAX:  return "Holding at max - surplus exceeds charger's limit";
         case DECISION_CAPPED_ZERO: return "Holding at 0A - no surplus available";
         case DECISION_HOLD:        return "Holding - matched to surplus";
@@ -38,34 +45,89 @@ static const char *decision_reason_str(ControlDecision d) {
     }
 }
 
-// Settling-gated integration from surplus power to target current. The EV's own draw is
-// part of what the meter measures, so each accepted change starts a settle window and
-// readings during it are ignored (still displayed/logged, not acted on) so the loop
-// doesn't fight its own effect on the next poll.
-static ControlDecision compute_next_target_amps(float currentTargetA, float gridPowerW,
-                                                  uint32_t nowMs, uint32_t &lastChangeMs,
-                                                  float &outTargetA, float mainsVoltageV,
-                                                  bool batteryDataValid) {
-    if (nowMs - lastChangeMs < SETTLE_MS) {
-        outTargetA = currentTargetA;
-        return DECISION_SETTLING;
-    }
+// Runtime-tunable control-loop damping. Defaults in config.h, overridden from the HTTP
+// control page and persisted in the "control" NVS namespace - the right values depend on
+// this install's actual inverter and vehicle lag, which can only be measured against real
+// weather, so they must be adjustable without a reflash. Only ever touched from
+// solar_control_task (poll loop writes, its own synchronous handlers write), so no mutex.
+struct ControlTuning {
+    uint32_t blank_ms;
+    uint16_t avg_samples;
+    float    gain_up;
+    float    deadband_a;
+    float    fast_drop_a;
+};
+static ControlTuning s_tuning = {
+    CONTROL_BLANK_MS_DEFAULT,
+    CONTROL_AVG_SAMPLES_DEFAULT,
+    CONTROL_GAIN_UP_DEFAULT,
+    CONTROL_DEADBAND_A_DEFAULT,
+    CONTROL_FAST_DROP_A_DEFAULT,
+};
 
-    float surplusW = -gridPowerW; // positive = exporting
+// Clamped on both load and set, so neither a corrupt NVS blob nor a hand-crafted query
+// arg can produce a divergent loop. gain_up in particular must never exceed 1.0.
+static void control_tuning_clamp(ControlTuning &t) {
+    t.blank_ms    = (uint32_t)constrain((long)t.blank_ms, 0L, 120000L);
+    t.avg_samples = (uint16_t)constrain((int)t.avg_samples, 1, 12);
+    t.gain_up     = constrain(t.gain_up, 0.1f, 1.0f);
+    t.deadband_a  = constrain(t.deadband_a, 0.0f, 5.0f);
+    t.fast_drop_a = constrain(t.fast_drop_a, 0.5f, MAX_CURRENT_A);
+}
 
-    // Full correction from the current surplus reading, no per-step magnitude limit -
-    // nothing in the CP protocol requires gradual changes. SETTLE_MS alone gates reaction
-    // rate. rawTargetA is the exact amps the current surplus supports, even from a cold
-    // start - a large surplus reaches equilibrium in one settled poll, not the floor first.
-    float deltaA = surplusW / mainsVoltageV;
-    // gridPowerW is already battery-discharge-excluded (see call site), but that exclusion
-    // is only trustworthy when the battery reading behind it is fresh. When it isn't, never
-    // increase the target on unverified data - holding or backing off is always safe, but an
-    // increase could secretly be drawing on undetected battery discharge.
-    if (!batteryDataValid) {
-        deltaA = fminf(deltaA, 0.0f);
-    }
-    float rawTargetA = constrain(currentTargetA + deltaA, 0.0f, MAX_CURRENT_A);
+static const char *CONTROL_NVS_NAMESPACE = "control";
+
+static void load_control_tuning_from_nvs() {
+    Preferences prefs;
+    prefs.begin(CONTROL_NVS_NAMESPACE, true);
+    s_tuning.blank_ms    = prefs.getULong("blank", CONTROL_BLANK_MS_DEFAULT);
+    s_tuning.avg_samples = prefs.getUShort("avgn", CONTROL_AVG_SAMPLES_DEFAULT);
+    s_tuning.gain_up     = prefs.getFloat("gup", CONTROL_GAIN_UP_DEFAULT);
+    s_tuning.deadband_a  = prefs.getFloat("db", CONTROL_DEADBAND_A_DEFAULT);
+    s_tuning.fast_drop_a = prefs.getFloat("fda", CONTROL_FAST_DROP_A_DEFAULT);
+    prefs.end();
+    control_tuning_clamp(s_tuning);
+}
+
+static void save_control_tuning_to_nvs() {
+    Preferences prefs;
+    prefs.begin(CONTROL_NVS_NAMESPACE, false);
+    prefs.putULong("blank", s_tuning.blank_ms);
+    prefs.putUShort("avgn", s_tuning.avg_samples);
+    prefs.putFloat("gup", s_tuning.gain_up);
+    prefs.putFloat("db", s_tuning.deadband_a);
+    prefs.putFloat("fda", s_tuning.fast_drop_a);
+    prefs.end();
+}
+
+// All control-law state that has to survive across polls. Kept as a solar_control_task
+// local passed by reference (like the bare lastChangeMs it replaces) rather than a
+// file-scope static, so the law stays a function of its arguments with no hidden globals
+// and the schedule-override path can reset it explicitly.
+struct ControlLoopState {
+    uint32_t lastChangeMs;      // start of the blanking window
+    bool     lastChangeWasDown; // gates the fast path during blanking - see the sign
+                                // argument in compute_next_target_amps()
+    float    surplusSumW;       // averaging accumulator; blanking samples never enter it
+    uint16_t sampleCount;
+    bool     batteryValidAll;   // AND across the window, not just the newest sample
+};
+
+static void control_state_reset(ControlLoopState &st, uint32_t nowMs) {
+    st.lastChangeMs = nowMs;
+    st.lastChangeWasDown = false;
+    st.surplusSumW = 0.0f;
+    st.sampleCount = 0;
+    st.batteryValidAll = true;
+}
+
+// Shared tail for both paths that actually reach a decision (the averaged one and the
+// fast drop): floor/hysteresis banding, deadband, accumulator reset, and the bookkeeping
+// that must happen exactly once per decision. Factored out so the two can't drift apart.
+static ControlDecision finish_decision(float currentTargetA, float rawTargetA,
+                                         uint32_t nowMs, ControlLoopState &st,
+                                         float &outTargetA, bool fastDrop) {
+    rawTargetA = constrain(rawTargetA, 0.0f, MAX_CURRENT_A);
 
     // Mirrors cp_interceptor.cpp's own STANDBY/OSCILLATING thresholds: bare
     // MIN_CURRENT_A floor on entry (no margin), HYSTERESIS_A margin only on exit.
@@ -81,11 +143,36 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
         newTargetA = rawTargetA;
     }
 
+    // Deadband, applied AFTER the banding above so it can never suppress a floor crossing
+    // (those move the target by at least MIN_CURRENT_A). A sub-threshold correction must
+    // not restart the blanking window either - a 0.05A nudge the clamp would ignore
+    // outright used to cost a full settle window of responsiveness.
+    if (fabsf(newTargetA - currentTargetA) < s_tuning.deadband_a) {
+        newTargetA = currentTargetA;
+    }
+
+    // A decision that actually moved the target invalidates every sample taken at the old
+    // operating point, and an averaged decision has consumed its window either way - so both
+    // reset. The one case that must NOT is a fast-path check that changed nothing: the
+    // banding above can compress a cut back below the deadband (e.g. 6.2A with a 1.0A
+    // fast-drop lands in the hysteresis band and snaps back to 6.0A, a 0.2A move), and with
+    // sustained import that repeats every poll - resetting there would restart the averaging
+    // window forever and leave the target stuck while importing.
+    if (!fastDrop || newTargetA != currentTargetA) {
+        st.surplusSumW = 0.0f;
+        st.sampleCount = 0;
+        st.batteryValidAll = true;
+    }
+
     ControlDecision decision;
-    if (newTargetA > currentTargetA) {
-        decision = DECISION_STEP_UP;
-    } else if (newTargetA < currentTargetA) {
-        decision = DECISION_STEP_DOWN;
+    if (newTargetA != currentTargetA) {
+        // Only an accepted CHANGE restarts blanking: a hold has no plant transient to wait
+        // out, so an idle loop simply re-decides every avg_samples polls.
+        st.lastChangeMs = nowMs;
+        st.lastChangeWasDown = (newTargetA < currentTargetA);
+        decision = fastDrop ? DECISION_FAST_DROP
+                 : (newTargetA > currentTargetA) ? DECISION_STEP_UP
+                 : DECISION_STEP_DOWN;
     } else if (newTargetA >= MAX_CURRENT_A) {
         decision = DECISION_CAPPED_MAX;
     } else if (newTargetA <= 0.0f) {
@@ -94,11 +181,96 @@ static ControlDecision compute_next_target_amps(float currentTargetA, float grid
         decision = DECISION_HOLD;
     }
 
-    if (newTargetA != currentTargetA) {
-        lastChangeMs = nowMs;
-    }
     outTargetA = newTargetA;
     return decision;
+}
+
+// Damped, averaged integration from surplus power to target current.
+//
+// The EV's own draw is part of what the meter measures, so this is a closed loop against a
+// plant that answers late. At gain 1 with one decision-period of unabsorbed lag the error
+// recurrence is e[n+1] = e[n] - e[n-1], whose poles sit exactly ON the unit circle: an
+// undamped ring with a period of six decisions, which is what showed up as the charge
+// current oscillating on cloudy days. Damping the correction to gain g moves those poles
+// to magnitude sqrt(g), and because the law is still an integrator the steady-state error
+// stays zero - large errors still move far, so this is NOT the per-step rate cap that was
+// removed earlier. See CLAUDE.md "Control-loop damping".
+static ControlDecision compute_next_target_amps(float currentTargetA, float gridPowerW,
+                                                  uint32_t nowMs, ControlLoopState &st,
+                                                  float &outTargetA, float mainsVoltageV,
+                                                  bool batteryDataValid) {
+    const float surplusW = -gridPowerW; // positive = exporting
+    const float instantDeltaA = surplusW / mainsVoltageV;
+    const bool blanking = (nowMs - st.lastChangeMs) < s_tuning.blank_ms;
+
+    // Accumulated before the fast-path check below, not after, so a sample still counts
+    // toward the mean on a poll where the fast path also looks at it. Otherwise a fast-path
+    // check that ends up changing nothing would consume the poll without advancing the
+    // averaging window, and sustained import could stall the loop entirely.
+    if (!blanking) {
+        st.surplusSumW += surplusW;
+        st.sampleCount++;
+        st.batteryValidAll = st.batteryValidAll && batteryDataValid;
+    }
+
+    // --- Fast path: real import cuts now, full gain, no waiting for the mean ------------
+    // Armed during the blanking window that follows an UP change: there the un-ramped car
+    // makes the meter read MORE export than reality, so an import reading understates the
+    // deficit and a full-gain cut is an under-cut - safe. Suppressed during the window
+    // after a DOWN change: there the residual import IS our own previous cut, not yet
+    // absorbed, and acting on it is the exact double-count this function exists to avoid -
+    // it would cut through the floor and open the CP disconnect relay. Gated on a nonzero
+    // target because there is nothing left to cut at 0A, and an evening's house load alone
+    // (800W = 3.3A) would otherwise fire this every poll and starve the averaging window
+    // forever.
+    if (currentTargetA > 0.0f && !(blanking && st.lastChangeWasDown) &&
+        instantDeltaA <= -s_tuning.fast_drop_a) {
+        return finish_decision(currentTargetA, currentTargetA + instantDeltaA,
+                               nowMs, st, outTargetA, true);
+    }
+
+    if (blanking) {
+        // Discarded, NOT accumulated. These readings still show the plant's previous
+        // operating point, so averaging them in would bias the mean toward the pre-ramp,
+        // apparently-larger surplus - making the oscillation worse rather than better.
+        outTargetA = currentTargetA;
+        return DECISION_BLANKING;
+    }
+
+    // --- Averaging phase ----------------------------------------------------------------
+    // The sample was accumulated above. The target is constant for the whole of this window,
+    // so every sample measures the same operating point and the only variance left is
+    // genuine PV/house variance - which makes the mean unbiased. Counting samples rather
+    // than milliseconds means a failed Modbus poll delays the decision instead of shrinking
+    // the sample set.
+    if (st.sampleCount < s_tuning.avg_samples) {
+        outTargetA = currentTargetA;
+        return DECISION_AVERAGING;
+    }
+
+    float deltaA = (st.surplusSumW / (float)st.sampleCount) / mainsVoltageV;
+
+    // Damp increases only, and only once already charging. At target 0 the EV contributes
+    // nothing to the meter, so this reading is the true supportable current rather than an
+    // error term carrying our own lag - damping it would move the effective entry
+    // threshold from MIN_CURRENT_A to MIN_CURRENT_A/gain_up (6A -> 8.6A at 0.7) and stop
+    // charging ever starting in that band.
+    if (deltaA > 0.0f && currentTargetA >= MIN_CURRENT_A) {
+        deltaA *= s_tuning.gain_up;
+    }
+    // gridPowerW is already battery-discharge-excluded (see call site), but that exclusion
+    // is only trustworthy when the battery reading behind it is fresh. When it isn't, never
+    // increase the target on unverified data - holding or backing off is always safe, but an
+    // increase could secretly be drawing on undetected battery discharge. ANDed across the
+    // whole window, not just the newest sample: one untrusted reading anywhere in it must
+    // forbid an averaged increase, or smoothing would walk straight past this guard. Kept
+    // last so it stays unconditionally final regardless of the gain above.
+    if (!st.batteryValidAll) {
+        deltaA = fminf(deltaA, 0.0f);
+    }
+
+    return finish_decision(currentTargetA, currentTargetA + deltaA,
+                           nowMs, st, outTargetA, false);
 }
 
 // WiFi SSID/password are provisioned entirely over BLE (ble_config.cpp), read here from
@@ -216,6 +388,14 @@ static SolarStatus s_last_solar_status = {};
 static float s_last_target_amps = 0.0f;
 static ControlDecision s_last_decision = DECISION_HOLD;
 static uint32_t s_last_lastChangeMs = 0;
+static uint16_t s_last_sample_count = 0;
+
+// Set by the handlers that change what the control loop is looking at (the grid source, or
+// the tuning values themselves) and consumed once by the poll loop. A half-full averaging
+// accumulator would otherwise span two different plants, or hold more samples than the new
+// avg_samples asks for, and produce one wrong decision. Matters in practice because
+// switching sources mid-run is how the damping gets bench-tested.
+static bool s_control_reset_requested = false;
 
 // Server-side power history for the control page's chart - a fixed ring of 5-minute
 // buckets (not raw per-poll samples) so every browser session sees the same rolling 24h
@@ -385,9 +565,14 @@ static const char PAGE_HTML[] PROGMEM = R"PAGE(<!DOCTYPE html>
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-.wrap{max-width:900px;margin:0 auto;padding:24px 20px 60px}
+/* Width is coupled to the grid below: the four settings cards only form four columns if
+   the content box fits 4x260px plus three 16px gaps = 1088px, so this must stay at or
+   above 1088 + 40 of padding. Narrowing it silently drops back to a 3-column layout. */
+.wrap{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
 .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px}
 .topbar h1{font-size:1.3rem;margin:0}
+/* auto-fit, so the four cards sit in one row on a desktop and reflow to 3/2/1 columns on
+   narrower viewports without any media query. See .wrap's max-width above. */
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
 .card{background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius);
   padding:20px;box-shadow:var(--shadow)}
@@ -471,6 +656,38 @@ select{width:100%}
         </div>
       </section>
 
+      <!-- Control-loop damping against measurement lag. Tunable here rather than compiled
+           in because the right values depend on this install's inverter and vehicle lag,
+           which can only be measured against real weather. Labels are kept short so they
+           don't wrap in a narrow grid column - the tooltips carry the full meaning. -->
+      <section class="card card-settings">
+        <h2>Control tuning</h2>
+        <div class="field">
+          <label for="tuneBlank" title="Readings this soon after a change are discarded - the meter and the car haven't caught up yet">Blanking (s)</label>
+          <input type="number" id="tuneBlank" min="0" max="120" step="0.5">
+        </div>
+        <div class="field">
+          <label for="tuneAvgN" title="Readings averaged together before each decision, instead of acting on one sample">Samples per decision</label>
+          <input type="number" id="tuneAvgN" min="1" max="12" step="1">
+        </div>
+        <div class="field">
+          <label for="tuneGainUp" title="Fraction of the correction applied when increasing. 1.0 = undamped; decreases always use full gain">Gain on increases</label>
+          <input type="number" id="tuneGainUp" min="0.1" max="1" step="0.05">
+        </div>
+        <div class="field">
+          <label for="tuneDeadband" title="Changes smaller than this are ignored, so tiny corrections don't restart the timing window">Deadband (A)</label>
+          <input type="number" id="tuneDeadband" min="0" max="5" step="0.1">
+        </div>
+        <div class="field">
+          <label for="tuneFastDrop" title="Grid import above this cuts current immediately, without waiting for the average">Fast-drop import (A)</label>
+          <input type="number" id="tuneFastDrop" min="0.5" max="32" step="0.5">
+        </div>
+        <div class="field">
+          <button id="tuningSaveBtn" type="button">Save</button>
+        </div>
+        <div class="stat-sub">Lower gain and more samples damp harder; raise blanking first if the current still oscillates.</div>
+      </section>
+
       <section class="card card-settings">
         <h2>Schedule</h2>
         <div class="field">
@@ -536,6 +753,13 @@ select{width:100%}
   var SCHEDULE_FIELD_IDS = ['scheduleEnabled', 'scheduleStart', 'scheduleEnd', 'scheduleAmps'];
   function scheduleFieldFocused(){
     return SCHEDULE_FIELD_IDS.indexOf(document.activeElement && document.activeElement.id) !== -1;
+  }
+
+  // Same reason as the schedule guard above: the 5s poll must not overwrite a value the
+  // user is part-way through typing.
+  var TUNING_FIELD_IDS = ['tuneBlank', 'tuneAvgN', 'tuneGainUp', 'tuneDeadband', 'tuneFastDrop'];
+  function tuningFieldFocused(){
+    return TUNING_FIELD_IDS.indexOf(document.activeElement && document.activeElement.id) !== -1;
   }
 
   // Populated from /api/history (see fetchHistory below) - the device itself owns this
@@ -685,7 +909,11 @@ select{width:100%}
 
     $('targetWatts').textContent = Math.round(d.target_w) + ' W';
     $('targetAmps').textContent = '(' + d.target_a.toFixed(1) + ' A)';
-    $('decision').textContent = d.decision + (d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
+    // Averaging shows sample progress as well as the estimated countdown, since a failed
+    // poll stretches the wall clock but doesn't lose a sample.
+    $('decision').textContent = d.decision
+      + (d.avg_n > 0 ? ' (' + d.avg_n + '/' + d.avg_of + ' samples)'
+        : d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
     $('gridWatts').textContent = Math.abs(d.grid_w).toFixed(0) + ' W ' + (d.exporting ? 'exporting' : 'importing');
     $('gridFlow').className = 'flow-dot ' + (d.exporting ? 'flow-export' : 'flow-import');
 
@@ -724,6 +952,14 @@ select{width:100%}
     $('scheduleActiveBadge').innerHTML = d.schedule_active ? badge('ok', 'Active now') : '';
     $('timeSyncWarn').style.display = d.time_synced ? 'none' : '';
 
+    if (!tuningFieldFocused()) {
+      $('tuneBlank').value = d.tune_blank_s;
+      $('tuneAvgN').value = d.tune_avg_n;
+      $('tuneGainUp').value = d.tune_gain_up;
+      $('tuneDeadband').value = d.tune_deadband_a;
+      $('tuneFastDrop').value = d.tune_fast_drop_a;
+    }
+
     drawChart();
   }
 
@@ -760,6 +996,15 @@ select{width:100%}
         + '&amps=' + encodeURIComponent($('scheduleAmps').value);
       applyAndRender(url);
     });
+    $('tuningSaveBtn').addEventListener('click', function(){
+      var url = '/api/set_tuning'
+        + '?blank_s=' + encodeURIComponent($('tuneBlank').value)
+        + '&avg_n=' + encodeURIComponent($('tuneAvgN').value)
+        + '&gain_up=' + encodeURIComponent($('tuneGainUp').value)
+        + '&deadband_a=' + encodeURIComponent($('tuneDeadband').value)
+        + '&fast_drop_a=' + encodeURIComponent($('tuneFastDrop').value);
+      applyAndRender(url);
+    });
     window.addEventListener('resize', drawChart);
     poll();
     setInterval(poll, 5000);
@@ -785,7 +1030,15 @@ static void handle_root() {
 // in this same task) never has to find room for it on the stack. Only ever holds
 // compile-time-constant strings plus a few numbers, never user-controllable text, so no
 // JSON-escaping is needed.
-static char s_json_body[2048];
+//
+// Sized against a computed worst case of 2048 bytes: the longest cp_mode_title/
+// cp_duty_title/connector_title/decision strings, the longest source name, all 7 registry
+// entries, build_id, the avg_n/avg_of averaging progress and the five tune_* values.
+// Re-check that arithmetic before adding another field or another grid source -
+// build_status_json() truncates SILENTLY, and a truncated body is invalid JSON, which
+// makes the page's JSON.parse() throw and blanks the whole dashboard (the same failure
+// mode a NaN history bucket once produced).
+static char s_json_body[3072];
 
 static size_t append_sources_json(char *buf, size_t bufSize, size_t offset) {
     for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < bufSize; i++) {
@@ -821,10 +1074,15 @@ static const char *build_status_json() {
     const char *batteryStateStr = !batteryDataValid ? "unknown"
                                     : (batteryPowerW < 0.0f) ? "discharging"
                                     : (batteryPowerW > 0.0f) ? "charging" : "idle";
+    // Both waiting phases feed the same countdown the page already renders. The averaging
+    // figure is an estimate by design: it assumes every remaining poll succeeds, and a
+    // failed one legitimately stretches the window rather than shrinking the sample set.
     uint32_t settleRemainingS = 0;
-    if (s_last_decision == DECISION_SETTLING) {
+    if (s_last_decision == DECISION_BLANKING) {
         uint32_t elapsed = nowMs - s_last_lastChangeMs;
-        settleRemainingS = (elapsed < SETTLE_MS) ? (SETTLE_MS - elapsed) / 1000 : 0;
+        settleRemainingS = (elapsed < s_tuning.blank_ms) ? (s_tuning.blank_ms - elapsed) / 1000 : 0;
+    } else if (s_last_decision == DECISION_AVERAGING && s_last_sample_count < s_tuning.avg_samples) {
+        settleRemainingS = (uint32_t)(s_tuning.avg_samples - s_last_sample_count) * (POLL_INTERVAL_MS / 1000);
     }
 
     char pollAgeStr[24];
@@ -869,6 +1127,13 @@ static const char *build_status_json() {
         "\"battery_data_valid\":%s,"
         "\"surplus_excluded_w\":%.0f,"
         "\"settle_s\":%lu,"
+        "\"avg_n\":%u,"
+        "\"avg_of\":%u,"
+        "\"tune_blank_s\":%.1f,"
+        "\"tune_avg_n\":%u,"
+        "\"tune_gain_up\":%.2f,"
+        "\"tune_deadband_a\":%.2f,"
+        "\"tune_fast_drop_a\":%.2f,"
         "\"target_a\":%.1f,"
         "\"target_w\":%.0f,"
         "\"cp_mode\":\"%s\","
@@ -905,6 +1170,13 @@ static const char *build_status_json() {
         batteryDataValid ? "true" : "false",
         surplusExcludedW,
         (unsigned long)settleRemainingS,
+        (unsigned)s_last_sample_count,
+        (unsigned)s_tuning.avg_samples,
+        (float)s_tuning.blank_ms / 1000.0f,
+        (unsigned)s_tuning.avg_samples,
+        s_tuning.gain_up,
+        s_tuning.deadband_a,
+        s_tuning.fast_drop_a,
         s_last_target_amps,
         s_last_target_amps * s_last_mains_voltage_v,
         cpModeLabel, cpModeStr, cpModeCls,
@@ -951,7 +1223,42 @@ static void handle_api_set_source() {
         // id in the request self-heals to the default rather than saving a
         // value that would need re-resolving (with a fallback) on next boot.
         save_grid_source_to_nvs(s_active_grid_source->id);
+        // The plant the control loop is closing around just changed; don't average the
+        // new source's readings together with the old one's.
+        s_control_reset_requested = true;
     }
+    s_web_server.send(200, "application/json", build_status_json());
+}
+
+// Control-loop damping tuning. Same leave-prior-value-on-bad-input pattern as
+// handle_api_set_schedule() below - a malformed value is ignored rather than rejecting the
+// whole request. Every field is clamped by control_tuning_clamp(), so no argument here can
+// put the loop outside its stable range regardless of what is sent.
+static void handle_api_set_tuning() {
+    if (!require_auth()) {
+        return;
+    }
+    send_no_cache_headers();
+    if (s_web_server.hasArg("blank_s")) {
+        s_tuning.blank_ms = (uint32_t)(s_web_server.arg("blank_s").toFloat() * 1000.0f);
+    }
+    if (s_web_server.hasArg("avg_n")) {
+        s_tuning.avg_samples = (uint16_t)s_web_server.arg("avg_n").toInt();
+    }
+    if (s_web_server.hasArg("gain_up")) {
+        s_tuning.gain_up = s_web_server.arg("gain_up").toFloat();
+    }
+    if (s_web_server.hasArg("deadband_a")) {
+        s_tuning.deadband_a = s_web_server.arg("deadband_a").toFloat();
+    }
+    if (s_web_server.hasArg("fast_drop_a")) {
+        s_tuning.fast_drop_a = s_web_server.arg("fast_drop_a").toFloat();
+    }
+    control_tuning_clamp(s_tuning);
+    save_control_tuning_to_nvs();
+    // A shrunk avg_samples could otherwise leave the accumulator holding more samples than
+    // the new window wants.
+    s_control_reset_requested = true;
     s_web_server.send(200, "application/json", build_status_json());
 }
 
@@ -1057,6 +1364,7 @@ static void register_network_services() {
     s_web_server.on("/api/status", HTTP_GET, handle_api_status);
     s_web_server.on("/api/set_source", HTTP_GET, handle_api_set_source);
     s_web_server.on("/api/set_schedule", HTTP_GET, handle_api_set_schedule);
+    s_web_server.on("/api/set_tuning", HTTP_GET, handle_api_set_tuning);
     s_web_server.on("/api/history", HTTP_GET, handle_api_history);
 }
 
@@ -1085,6 +1393,7 @@ void solar_control_task(void *pvParameters) {
     uint32_t lastAppliedGeneration = cfg.generation;
     load_grid_source_from_nvs();
     load_schedule_from_nvs();
+    load_control_tuning_from_nvs();
     history_load_from_fs();
 
     connect_wifi(cfg);
@@ -1096,7 +1405,8 @@ void solar_control_task(void *pvParameters) {
     }
 
     float targetAmps = 0.0f;
-    uint32_t lastChangeMs = millis();
+    ControlLoopState ctl;
+    control_state_reset(ctl, millis());
     uint32_t lastPollMs = 0;
     uint32_t lastWifiAttemptMs = 0;
     uint32_t lastPollSuccessMs = 0;
@@ -1145,6 +1455,13 @@ void solar_control_task(void *pvParameters) {
         if (now - lastPollMs >= POLL_INTERVAL_MS) {
             lastPollMs = now;
 
+            // The grid source or the tuning values changed under us since the last poll -
+            // start a clean window rather than deciding on a part-full accumulator.
+            if (s_control_reset_requested) {
+                s_control_reset_requested = false;
+                control_state_reset(ctl, now);
+            }
+
             // Evaluated every poll tick regardless of WiFi/Modbus outcome
             // below - a scheduled fixed-current charge must not depend on
             // the grid-data pipeline (see CLAUDE.md "Solar data source" and
@@ -1172,10 +1489,15 @@ void solar_control_task(void *pvParameters) {
             if (scheduleActive) {
                 targetAmps = constrain(s_schedule.amps, MIN_CURRENT_A, MAX_CURRENT_A);
                 shared_state_set_target_amps(targetAmps);
-                // Fresh settle window for solar control's own hysteresis the
-                // moment the schedule ends - targetAmps was just set from
-                // the schedule, not derived from a surplus reading.
-                lastChangeMs = now;
+                // Fresh blanking window the moment the schedule ends - targetAmps was just
+                // set from the schedule, not derived from a surplus reading, so there is no
+                // accumulated sample worth keeping either. Marked as a downward change
+                // because the schedule may just have imposed a large cut (a fixed 6A after
+                // solar had been running at 20A), which is a down-transient like any other:
+                // that suppresses the fast path for one blanking window on exit, so the
+                // loop doesn't act on its own not-yet-absorbed reduction.
+                control_state_reset(ctl, now);
+                ctl.lastChangeWasDown = true;
                 s_last_decision = DECISION_SCHEDULE_OVERRIDE;
             }
 
@@ -1208,8 +1530,20 @@ void solar_control_task(void *pvParameters) {
                     // during a schedule window - it just stops feeding the
                     // control law while the schedule is in charge.
                     if (!scheduleActive) {
-                        s_last_decision = compute_next_target_amps(targetAmps, effectiveGridPowerW, now, lastChangeMs, targetAmps, voltageV, batteryDataValid);
+                        // millis() rather than the loop-top `now`, which was taken before a
+                        // Modbus read that can block for seconds - blanking is a
+                        // physical-time guard, so it should be measured from the moment the
+                        // decision is actually made.
+                        float prevTargetA = targetAmps;
+                        s_last_decision = compute_next_target_amps(targetAmps, effectiveGridPowerW, millis(), ctl, targetAmps, voltageV, batteryDataValid);
                         shared_state_set_target_amps(targetAmps);
+                        // The only per-poll trace in this file. Bench-tuning blank_ms
+                        // otherwise has to be done through the page's 5s poll, which is too
+                        // coarse to see a decision land.
+                        Serial.printf("control: grid=%.0fW eff=%.0fW batv=%d n=%u/%u %.2fA -> %.2fA (%s)\n",
+                            gridPowerW, effectiveGridPowerW, batteryDataValid ? 1 : 0,
+                            (unsigned)ctl.sampleCount, (unsigned)s_tuning.avg_samples,
+                            prevTargetA, targetAmps, decision_reason_str(s_last_decision));
                     }
                 }
             }
@@ -1217,7 +1551,8 @@ void solar_control_task(void *pvParameters) {
             shared_state_publish_solar_status(status);
             s_last_solar_status = status;
             s_last_target_amps = targetAmps;
-            s_last_lastChangeMs = lastChangeMs;
+            s_last_lastChangeMs = ctl.lastChangeMs;
+            s_last_sample_count = ctl.sampleCount;
 
             // Only record a real reading, never a synthetic zero from a WiFi/Modbus outage
             // or a pre-NTP-sync boot - an outage then shows as an honest time gap between
