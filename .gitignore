@@ -2,5 +2,6 @@
 .vscode/
 .claude/
 include/secrets.h
+include/build_info_stamp.h
 .env
 /schematic/solar-ev-charge-controller/solar-ev-charge-controller-backups

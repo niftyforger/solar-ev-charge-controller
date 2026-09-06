@@ -3,6 +3,7 @@
 #include "secrets.h"
 #include "shared_state.h"
 #include "grid_data_source.h"
+#include "build_info.h"
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
@@ -305,6 +306,19 @@ static bool require_auth() {
     return true;
 }
 
+// WebServer sends no cache headers of its own (its _prepareHeader emits only the status
+// line, Content-Type, Content-Length and Connection), so without this browsers fall back
+// to heuristic freshness and can keep serving a cached PAGE_HTML indefinitely after a
+// reflash - old JS talking to a new /api/status, with nothing on screen to say so. This
+// is also what makes the page's build_id auto-reload (see PAGE_HTML) actually converge:
+// a reload that got handed the same cached shell would just loop.
+//
+// _responseHeaders is consumed and cleared per response, so this has to be called from
+// each handler rather than once at setup.
+static void send_no_cache_headers() {
+    s_web_server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+}
+
 static const char *connector_state_str(ConnectorState s) {
     switch (s) {
         case CONN_STATE_A: return "A (idle, no vehicle)";
@@ -383,6 +397,7 @@ body{margin:0;background:var(--bg);color:var(--text);
 .stat-value{font-size:2.6rem;font-weight:700;line-height:1.1;letter-spacing:-.02em}
 .stat-value-sub{font-size:1.1rem;font-weight:500;color:var(--text-muted)}
 .stat-sub{color:var(--text-muted);margin-top:4px;font-size:.9rem}
+.foot{color:var(--text-muted);margin-top:24px;font-size:.8rem;text-align:center}
 .flow-row{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:.95rem}
 .flow-dot{width:10px;height:10px;border-radius:50%;flex:none}
 .flow-export{background:var(--ok)}
@@ -490,6 +505,10 @@ select{width:100%}
       </section>
     </div>
   </div>
+
+  <!-- Outside #dashboard on purpose: showError() hides that, and the running
+       firmware is still worth showing while the device is unreachable. -->
+  <div class="foot" id="buildInfo"></div>
 </div>
 <script>
 (function(){
@@ -523,6 +542,11 @@ select{width:100%}
   // rolling window so every browser session shows the same data, not a per-tab
   // reconstruction from /api/status polls.
   var history = [];
+
+  // build_id of the firmware this page was served by, captured from the first
+  // status response. Any later poll reporting a different one means the board
+  // has been reprogrammed under us, so this shell is stale - see render().
+  var seenBuildId = null;
 
   function fetchHistory(){
     fetch('/api/history', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(d){
@@ -645,6 +669,20 @@ select{width:100%}
   }
 
   function render(d){
+    // Before touching anything else: if the firmware changed, this page's JS is
+    // older than the API it's talking to, so reload rather than rendering against
+    // it. The no-store header on "/" (see send_no_cache_headers) is what stops
+    // this looping - without it the reload could be handed the same stale shell.
+    if (d.build_id) {
+      if (seenBuildId === null) {
+        seenBuildId = d.build_id;
+      } else if (d.build_id !== seenBuildId) {
+        location.reload();
+        return;
+      }
+      $('buildInfo').textContent = 'Firmware ' + d.build_id;
+    }
+
     $('targetWatts').textContent = Math.round(d.target_w) + ' W';
     $('targetAmps').textContent = '(' + d.target_a.toFixed(1) + ' A)';
     $('decision').textContent = d.decision + (d.settle_s > 0 ? ' (' + d.settle_s + 's left)' : '');
@@ -738,6 +776,7 @@ static void handle_root() {
     if (!require_auth()) {
         return;
     }
+    send_no_cache_headers();
     s_web_server.send_P(200, "text/html", PAGE_HTML);
 }
 
@@ -746,7 +785,7 @@ static void handle_root() {
 // in this same task) never has to find room for it on the stack. Only ever holds
 // compile-time-constant strings plus a few numbers, never user-controllable text, so no
 // JSON-escaping is needed.
-static char s_json_body[1792];
+static char s_json_body[2048];
 
 static size_t append_sources_json(char *buf, size_t bufSize, size_t offset) {
     for (size_t i = 0; i < GRID_SOURCE_REGISTRY_COUNT && offset < bufSize; i++) {
@@ -853,6 +892,9 @@ static const char *build_status_json() {
         "\"schedule_amps\":%.1f,"
         "\"schedule_active\":%s,"
         "\"time_synced\":%s,"
+        // Identifies the running firmware. The page compares this across polls and
+        // reloads itself when it changes (see PAGE_HTML), and shows it in the footer.
+        "\"build_id\":\"%s\","
         "\"sources\":[",
 
         decision_reason_str(s_last_decision),
@@ -880,7 +922,8 @@ static const char *build_status_json() {
         scheduleEndStr,
         s_schedule.amps,
         s_last_solar_status.schedule_active ? "true" : "false",
-        timeSyncedForStatus ? "true" : "false");
+        timeSyncedForStatus ? "true" : "false",
+        firmware_build_id());
 
     offset = append_sources_json(s_json_body, sizeof(s_json_body), offset);
     if (offset < sizeof(s_json_body)) {
@@ -893,6 +936,7 @@ static void handle_api_status() {
     if (!require_auth()) {
         return;
     }
+    send_no_cache_headers();
     s_web_server.send(200, "application/json", build_status_json());
 }
 
@@ -900,6 +944,7 @@ static void handle_api_set_source() {
     if (!require_auth()) {
         return;
     }
+    send_no_cache_headers();
     if (s_web_server.hasArg("id")) {
         s_active_grid_source = &grid_data_source_lookup(s_web_server.arg("id").c_str());
         // Persist the resolved id, not the raw request arg - an unrecognized
@@ -930,6 +975,7 @@ static void handle_api_set_schedule() {
     if (!require_auth()) {
         return;
     }
+    send_no_cache_headers();
     if (s_web_server.hasArg("enabled")) {
         s_schedule.enabled = s_web_server.arg("enabled") == "1";
     }
@@ -992,6 +1038,7 @@ static void handle_api_history() {
     if (!require_auth()) {
         return;
     }
+    send_no_cache_headers();
     s_web_server.send(200, "application/json", build_history_json());
 }
 
