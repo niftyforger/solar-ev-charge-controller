@@ -530,7 +530,12 @@ select{width:100%}
         return {t: p.t * 1000, target: p.target_w, grid: p.grid_w};
       });
       drawChart();
-    }).catch(function(){});
+    }).catch(function(e){
+      // Keep the last good chart rather than blanking it, but never swallow the reason -
+      // an empty catch here once hid a malformed-JSON response (a NaN average) as a
+      // silently empty chart with nothing in the console to go on.
+      console.error('history fetch/parse failed:', e);
+    });
   }
 
   function drawChart(){
@@ -958,14 +963,24 @@ static const char *build_history_json() {
 
     size_t count = (s_history_created < HISTORY_BUCKET_CAPACITY) ? s_history_created : HISTORY_BUCKET_CAPACITY;
     size_t oldest = s_history_created - count;
+    bool anyEmitted = false;
     for (size_t i = 0; i < count && offset < sizeof(s_history_json_body); i++) {
         const HistoryBucket &b = s_history[(oldest + i) % HISTORY_BUCKET_CAPACITY];
+        // A bucket can legitimately hold no samples - e.g. a persisted buffer restored from
+        // flash whose newest bucket never received a reading before the reboot. Averaging it
+        // divides by zero and prints "nan", which is NOT valid JSON, so a single such bucket
+        // makes the browser's JSON.parse() throw and blanks the entire chart. Skip it: a gap
+        // reads honestly, exactly as an outage already does.
+        if (b.sample_count == 0) {
+            continue;
+        }
         offset += snprintf(s_history_json_body + offset, sizeof(s_history_json_body) - offset,
             "%s{\"t\":%lu,\"target_w\":%.0f,\"grid_w\":%.0f}",
-            (i == 0) ? "" : ",",
+            anyEmitted ? "," : "",
             (unsigned long)b.start_epoch_s,
             b.target_sum_w / b.sample_count,
             b.grid_sum_w / b.sample_count);
+        anyEmitted = true;
     }
     if (offset < sizeof(s_history_json_body)) {
         offset += snprintf(s_history_json_body + offset, sizeof(s_history_json_body) - offset, "]}");
@@ -1176,11 +1191,16 @@ void solar_control_task(void *pvParameters) {
                     cur->grid_sum_w = 0.0f;
                     cur->sample_count = 0;
                     s_history_created++;
-                    history_save_to_fs();
                 }
                 cur->target_sum_w += targetAmps * s_last_mains_voltage_v;
                 cur->grid_sum_w += status.grid_power_w;
                 cur->sample_count++;
+                // Persisted only after the first sample lands, never on the bare bucket -
+                // saving in between leaves a zero-sample bucket in the file that a reboot
+                // restores and that can never be filled afterwards (its window has passed).
+                if (needNewBucket) {
+                    history_save_to_fs();
+                }
             }
         }
 
