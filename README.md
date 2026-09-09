@@ -158,6 +158,8 @@ EVSE enclosure:
 | | |
 |---|---|
 | <img src="img/EVSE_1.jpg" width="600" alt="Control board installed inside the EVSE enclosure"> | <img src="img/EVSE_2.jpg" width="600" alt="Control board installed inside the EVSE enclosure"> |
+| <img src="img/EVSE_3.jpg" width="600" alt="Control board installed inside the EVSE enclosure"> | <img src="img/EVSE_4.jpg" width="600" alt="Interceptor board in its 3D-printed enclosure"> |
+| <img src="img/EVSE_5.jpg" width="600" alt="Interceptor enclosure, closed"> | <img src="img/EVSE_6.jpg" width="600" alt="Interceptor board mounted inside the powered-on EVSE"> |
 
 ## Author
 
