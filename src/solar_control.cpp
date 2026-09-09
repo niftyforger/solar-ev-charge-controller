@@ -632,6 +632,7 @@ select{width:100%}
     <div class="grid">
       <section class="card">
         <h2>Charge point</h2>
+        <div class="stat-sub" title="The ceiling offered to the car via CP - it may draw less">Target (ceiling)</div>
         <div class="stat-value"><span id="targetWatts">-- W</span> <span class="stat-value-sub" id="targetAmps">(-- A)</span></div>
         <div class="stat-sub" id="decision">Loading&hellip;</div>
         <div class="kv"><span>Solar control</span><span id="cpMode">--</span></div>

@@ -9,7 +9,7 @@ For full pin assignments, register maps, timing/ISR design detail, and the fail-
 
 ## How it works
 
-A single ESP32-S3 splits the job across its two cores: Core 0 polls the inverter over WiFi and decides how many amps the surplus can support; Core 1 runs the real-time loop that actually shapes the CP waveform between the charger and the car. The two talk over a small queue/mutex bridge — Core 1 never blocks on anything Core 0-side.
+A single ESP32-S3 splits the job across its two cores: Core 0 polls the inverter over WiFi and decides a target amps — a ceiling offered via CP, not what the car necessarily draws; Core 1 runs the real-time loop that actually shapes the CP waveform between the charger and the car. The two talk over a small queue/mutex bridge — Core 1 never blocks on anything Core 0-side.
 
 ```mermaid
 flowchart LR
