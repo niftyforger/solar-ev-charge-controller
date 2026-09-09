@@ -1108,11 +1108,11 @@ static const char *build_status_json() {
     const char *cpDutyStr = (cp.mode != MODE_ACTIVE)
         ? "Clamp inactive - CP fail-safe bypass, charger running at its native rate"
         : (cp.duty_state == CP_OSCILLATING)
-            ? "Oscillating - clamping every cycle to the target duty"
-            : "Disconnected - surplus below the 6A floor, CP relay open, not charging";
+            ? "Clamping the CP line every cycle to hold the target duty cycle (charging)"
+            : "CP relay open - surplus below the 6A floor, vehicle isolated, not charging";
     const char *cpDutyLabel = (cp.mode != MODE_ACTIVE)
         ? "N/A"
-        : (cp.duty_state == CP_OSCILLATING) ? "Oscillating" : "Standby";
+        : (cp.duty_state == CP_OSCILLATING) ? "Clamping CP" : "CP Disconnected";
     const char *cpDutyCls = (cp.mode != MODE_ACTIVE)
         ? "muted"
         : (cp.duty_state == CP_OSCILLATING) ? "ok" : "warn";
